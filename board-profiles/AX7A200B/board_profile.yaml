@@ -1,0 +1,226 @@
+# AX7A200B Board Profile — Machine-readable default board config
+# Generated 2026-05-13 from: 黑金AX7A200B开发板用户手册REV1.0.pdf
+
+board_id: AX7A200B
+board_name: 黑金 AX7A200B
+vendor: 芯驿电子科技（上海）有限公司 (ALINX)
+default_target: true
+preferred_flow: tensorflow-first  # tensorflow-first | pytorch-alt
+
+manual_path: D:\FPGA_AX7A200_develop\AX7A200\CD\黑金AX7A200B开发板用户手册REV1.0.pdf
+
+fpga:
+  family: Artix-7
+  part: xc7a200tfbg484-2
+  full_part: XC7A200T-2FBG484I
+  package: FBG484
+  pins: 484
+  speed_grade: -2
+  temp_grade: Industrial
+  logic_cells: 215360
+  slices: 33650
+  flip_flops: 269200
+  bram_kb: 13140
+  dsp_slices: 740
+  gtp_transceivers: 4
+  gtp_max_speed_gbps: 6.6
+  pcie_gen2: 1
+  xadc: "1x 12bit 1Mbps"
+
+clock_sources:
+  sys_clk:
+    frequency_mhz: 200
+    type: LVDS_differential
+    chip: SiT9102-200.00MHz
+    fpga_pin_p: R4
+    fpga_pin_n: T4
+    bank: 34
+    clock_region: MRCC
+  gtp_ref_clk:
+    frequency_mhz: 125
+    type: LVDS_differential
+    chip: SiT9102-125.00MHz
+    fpga_pin_p: F6
+    fpga_pin_n: E6
+    bank: 216
+    clock_region: MGTREFCLK0
+
+# Board-facing pins the generated wrapper may use, with their provenance. A tool must
+# not have to guess these, and a human must not have to retype them each run.
+board_pins:
+  clock:
+    kind: differential
+    clk_p: R4
+    clk_n: T4
+    frequency_mhz: 200
+    # The frequency the accelerator itself must run at; the reference oscillator above
+    # is divided down to it through the MMCM. Declared rather than assumed so a second
+    # board with a different reference cannot inherit this one's clock network silently.
+    core_frequency_mhz: 100
+    iostandard: DIFF_SSTL15
+    provenance: >-
+      pins R4/T4 from the manual (REV1.0, 200 MHz SiT9102 differential oscillator, bank
+      34); IOSTANDARD DIFF_SSTL15 is the standard validated by the vendor's own
+      uart_test.xdc / IO report for this bank, whose VCCO is 1.5 V. The manual's
+      default_constraints.xdc says LVDS, but Vivado rejects LVDS on a 1.5 V bank and
+      leaves both clock ports at IOSTANDARD DEFAULT, which blocks write_bitstream
+      (defect D-019).
+    requires_operator_confirmation: false
+    operator_confirmation: >-
+      Confirmed by the operator on 2026-09-27: use DIFF_SSTL15 for this bank. The flag was
+      true while the override was unconfirmed; it is kept here as the record of who
+      confirmed it and when.
+  reset:
+    port: RESET_N
+    pin: F15
+    iostandard: LVCMOS33
+    active_low: true
+    provenance: >-
+      AX7A200B REV1.0 manual plus the vendor's validated uart_test.xdc / IO report.
+      default_constraints.xdc leaves RESET_N as TBD.
+  led:
+    port: LED1
+    pin: W5
+    iostandard: LVCMOS15
+    provenance: default_constraints.xdc (manual-sourced), core-board user LED
+
+memory:
+  ddr3:
+    count: 2
+    chip: MT41J256M16HA-125
+    vendor: Micron
+    total_capacity_gbit: 8
+    data_width: 32
+    max_clock_mhz: 400
+    data_rate_mbps: 800
+    banks: [34, 35]
+    voltage: 1.5V
+  qspi_flash:
+    chip: N25Q128
+    vendor: Numonyx
+    capacity_mbit: 128
+    voltage: 3.3V
+
+peripherals:
+  leds:
+    core_user: LED1 (W5, BANK34, active-high)
+    ext_user: [LED2, LED3, LED4, LED5]  # pins TBD from ext board
+    power: PWR (red, always on)
+    config_done: DONE (red, on after FPGA config)
+  keys:
+    user: 4  # pins TBD
+    reset: 1  # active-low
+  ethernet:
+    chip: JL2121-N040I
+    vendor: 景略半导体
+    interface: RGMII
+    speed: 10/100/1000 Mbps
+    phy_addr: 001
+  fiber_sfp:
+    count: 2
+    sfp1:
+      # Two keys per line ("tx_p: B4; tx_n: A4") is not valid YAML: the reader sees the
+      # second colon inside a plain scalar and fails, which made this whole file
+      # unparseable and hid the manual-sourced clock pins from every tool. Split out.
+      tx_p: B4
+      tx_n: A4
+      rx_p: B8
+      rx_n: A8
+      tx_dis: J15
+      loss: H15
+    sfp2:
+      tx_p: D5
+      tx_n: C5
+      rx_p: D11
+      rx_n: C11
+      tx_dis: H14
+      loss: J14
+  pcie:
+    lanes: x2
+    standard: PCIe_Gen2
+    ref_clk_mhz: 100
+    ref_clk_source: PC_motherboard
+  hdmi_output:
+    chip: SIL9134
+    interface: parallel_video
+  hdmi_input:
+    chip: SIL9013
+    interface: parallel_video
+  uart:
+    chip: CP2102GM
+    interface: USB_mini
+    fpga_rxd: L14
+    fpga_txd: L15
+    iostandard: LVCMOS33
+    host_bridge:
+      chip: CP2102GM
+      usb_vid: "10c4"
+      usb_pid: "ea60"
+      serial_number: CA127350C9F9EF1187F562135C2A50C9
+      provenance: >-
+        Measured on this bench: the CP2102GM on the AX7A200B ext board enumerates as
+        USB\VID_10C4&PID_EA60\CA127350C9F9EF1187F562135C2A50C9 -> COM3, and that is the
+        bridge every recorded AX7A200B capture was taken through. Recorded as a board fact
+        so a capture can refuse a port that belongs to another board.
+    provenance: >-
+      AX7A200B REV1.0 manual plus the vendor's validated uart_test.xdc / IO report for
+      bank 34/35 at 3.3 V; the same pins the cnn-board-03 host build was measured on.
+      Stated explicitly because the gates check the routed pins against this profile
+      rather than against a pinout remembered in code.
+  sd_card:
+    type: MicroSD
+    modes: [SD, SPI]
+  eeprom:
+    chip: 24LC04
+    capacity_kbit: 4
+    interface: I2C
+    i2c_scl: M15
+    i2c_sda: M16
+  temp_sensor:
+    chip: LM75
+    interface: I2C
+  expansion_headers:
+    count: 2
+    pins_per_header: 40
+    voltage_levels: [3.3V, 5V, GND]
+
+jtag:
+  connector: 10-pin 2.54mm (ext board)
+  signals: [TCK, TDI, TDO, TMS, GND, +3.3V]
+  fpga_tck: V12
+  fpga_tdi: R13
+  fpga_tdo: U13
+  fpga_tms: T13
+  # The die name the JTAG chain reports (not the package-qualified part), the cable the
+  # board evidence was measured with, and the configuration mode. A session may pass a
+  # different cable; the record then names it as an override rather than as this fact.
+  target_name: xc7a200t
+  cable_serial: "210512180081"
+  cable: Digilent JTAG-HS1 210512180081
+  mode: volatile
+
+power:
+  input_voltage: DC_5V
+  regulators:
+    - {voltage: 1.0V, current_a: 6, chip: TLV62130RGT, target: FPGA_Core}
+    - {voltage: 1.5V, current_a: 3, chip: TLV62130RGT, target: DDR3_BANK34_35}
+    - {voltage: 1.8V, current_a: 3, chip: TLV62130RGT, target: FPGA_Aux}
+    - {voltage: 3.3V, current_a: 3, chip: TPS54620, target: FPGA_BANK_IO}
+    - {voltage: VCCO, current_a: NA, chip: SPX3819M5-3-3_LDO, target: BANK15_16}
+    - {voltage: VTT_VREF, current_a: NA, chip: TPS51200, target: DDR3_term}
+  power_sequence: "1.0V -> 1.8V -> (1.5V, 3.3V, VCCO) | 1.0V -> MGTAVCC -> MGTAVTT"
+
+constraints_available: true
+constraints_source: manual
+deployment_notes: >
+  JTAG download via ext board 10-pin header.
+  QSPI Flash boots FPGA on power-up.
+  USB-UART for serial debug at 115200 baud (typical).
+  PCIe requires external 100MHz refclk from host slot.
+
+unknowns:
+  - ext_board_led_pins      # User LED2-LED5 exact FPGA pins
+  - ext_board_key_pins      # 4 user keys + 1 reset exact FPGA pins
+  - expansion_header_40pin_pinout  # J11/J12 detailed pin map
+  - ddr3_pinout_table       # Full 32-bit DDR3 routing table
+  - default_ucf_xdc_path    # ALINX-provided constraint file location
