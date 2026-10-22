@@ -1,0 +1,69 @@
+# hls4ml Configuration Template
+# Generated for Vivado/Vitis 2025.2 with hls4ml 1.3.0
+#
+# Usage: python -c "import hls4ml; hls4ml.converters.convert_from_keras_model(...)"
+
+Model:
+  # Default precision for all layers
+  Precision:
+    default: ap_fixed<16,6>    # <total_bits, integer_bits>
+    # Per-layer overrides (uncomment and adjust):
+    # fc1_output: ap_fixed<8,4>
+    # conv2d_1: ap_fixed<12,5>
+
+  # Reuse factor: 1 = fully parallel, N = reuse N times
+  ReuseFactor: 1               # Higher = fewer resources, higher latency
+
+  # Strategy: Latency (minimize cycles) or Resource (minimize area)
+  Strategy: Latency
+
+  # BRAM usage control (max BRAM bits, increase to use more BRAM)
+  BramFactor: 1000000000
+
+  # PyTorch channels_first -> channels_last conversion. KEEP COMMENTED OUT for Keras
+  # models: when it is enabled for an already channels-last Keras model, hls4ml 1.3.0
+  # writes Dense weight matrices in a different order than the generated kernel reads
+  # them, so the hardware implements a different function from the same model.
+  # Measured on the keras_3layer AX7A200B contract, 2026-09-27:
+  #   enabled -> firmware/weights/w2.txt 87F14B723FE72F35,
+  #              CSim vs Python reference correlation 0.24, max abs error 14.9041
+  #              on a range of about +-15
+  #   omitted -> firmware/weights/w2.txt 7D68D8AA56FDD644 (byte-identical to a
+  #              known-good build of the same contract), correlation 1.0
+  # ChannelsLastConversion: full
+
+  # Transpose outputs back to channels_first (PyTorch only; same reasoning as above)
+  # TransposeOutputs: false
+
+  # Enable trace output for debugging
+  TraceOutput: false
+
+# Backend selection
+Backend: Vivado              # Options: Vivado, Vitis, Quartus, Catapult
+
+# Target board (optional, overrides part)
+# Board: pynq-z2
+
+# Target FPGA part (required if no board specified)
+# Default: ALINX AX7A200B (XC7A200T-2FBG484I)
+# Default: ALINX AX7A200B (XC7A200T-2FBG484I)
+Part: xc7a200tfbg484-2
+
+# Clock period in nanoseconds
+ClockPeriod: 5.0             # 200 MHz
+
+# Clock uncertainty as percentage
+ClockUncertainty: 12.5
+
+# IO type
+IOType: io_parallel          # io_parallel or io_stream
+
+# Output directory
+OutputDir: my-hls-test
+
+# Project name
+ProjectName: myproject
+
+# Optional: input/output testbench data for csim/cosim
+# InputData: input_data.npy
+# OutputPredictions: output_ref.npy
