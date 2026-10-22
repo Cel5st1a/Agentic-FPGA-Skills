@@ -1,0 +1,187 @@
+# Nexys Video Board Profile — Machine-readable default board config
+# Created 2026-10-01 from the Digilent board files and this bench's own measurements.
+#
+# Every board-facing pin below carries provenance. Nothing here is inferred from
+# "the FPGA is the same": the AX7A200B and the Nexys Video both carry an
+# xc7a200t die, but the package, the speed grade, the system clock, the UART
+# route and the reset button all differ. R4 is the sharpest example — the same
+# pin name is a 200 MHz differential pair on the AX7A200B (bank 34, 1.5 V) and a
+# 100 MHz single-ended LVCMOS33 input on the Nexys Video (bank 34, 3.3 V).
+
+board_id: NexysVideo
+board_name: Digilent Nexys Video
+vendor: Digilent
+default_target: false
+preferred_flow: tensorflow-first
+
+manual_path: https://digilent.com/reference/programmable-logic/nexys-video/reference-manual
+
+sources:
+  board_xml:
+    url: https://raw.githubusercontent.com/Digilent/vivado-boards/master/new/board_files/nexys_video/A.0/1.2/board.xml
+    sha256: 5fe56998aaae57825f28e999b1415126be8ce273030398d38678912af6f14a58
+  pin_map:
+    url: https://raw.githubusercontent.com/Digilent/vivado-boards/master/new/board_files/nexys_video/A.0/1.2/part0_pins.xml
+    sha256: 38c849c6c750b2ba6faaf7ad74e37a0ad9a177620587638f96d1213e4a5501e1
+  master_xdc:
+    url: https://raw.githubusercontent.com/Digilent/digilent-xdc/master/Nexys-Video-Master.xdc
+    sha256: 2debf0afb537c0a9f8f2c1569aa99e0366629a354f2fbdf369bd5142670086cc
+  measured:
+    when: 2026-10-01
+    what: >-
+      JTAG chain (`jtag targets` through hw_server on tcp:127.0.0.1:3121) and the
+      Windows PnP device tree on this bench, both recorded in
+      _line/reviews/nexys-video-bringup-20261001.md.
+
+fpga:
+  family: Artix-7
+  part: xc7a200tsbg484-1
+  full_part: XC7A200T-1SBG484C
+  package: SBG484
+  pins: 484
+  speed_grade: -1
+  temp_grade: Commercial
+  logic_cells: 215360
+  slices: 33650
+  flip_flops: 269200
+  bram_kb: 13140
+  dsp_slices: 740
+  provenance: >-
+    board.xml `<component name="part0" ... part_name="xc7a200tsbg484-1">` (sha256
+    5fe56998...). The JTAG chain independently reports the same die as the
+    AX7A200B: `xc7a200t (idcode 13636093 irlen 6 fpga)`. The die being equal does
+    not make the bitstreams interchangeable: the package decides the pinout and
+    the speed grade decides the timing.
+
+clock_sources:
+  sys_clk:
+    frequency_mhz: 100
+    type: single_ended
+    fpga_pin: R4
+    bank: 34
+    clock_region: MRCC
+    iostandard: LVCMOS33
+    provenance: >-
+      Nexys-Video-Master.xdc line 8: PACKAGE_PIN R4 IOSTANDARD LVCMOS33,
+      IO_L13P_T2_MRCC_34, Sch=sysclk; line 9 fixes it at
+      `create_clock -period 10.00` (100 MHz).
+
+# Board-facing pins the generated wrapper may use, with their provenance. A tool must
+# not have to guess these, and a human must not have to retype them each run.
+board_pins:
+  clock:
+    kind: single_ended
+    pin: R4
+    frequency_mhz: 100
+    core_frequency_mhz: 100
+    iostandard: LVCMOS33
+    provenance: >-
+      Digilent Nexys-Video-Master.xdc (sha256 2debf0af...), line 8, plus
+      part0_pins.xml `<pin index="0" name="clk" iostandard="LVCMOS33" loc="R4"/>`
+      (sha256 38c849c6...). Single-ended: there is no clk_n, and the pin must be
+      driven through IBUF, never IBUFDS. The AX7A200B declares the same R4 as the
+      P side of a 200 MHz DIFF_SSTL15 pair, so a profile-blind pin table would
+      silently constrain this board to a signal it does not have.
+    requires_operator_confirmation: false
+  reset:
+    port: CPU_RESETN
+    pin: G4
+    iostandard: LVCMOS15
+    active_low: true
+    provenance: >-
+      Digilent Nexys-Video-Master.xdc, red CPU RESET button:
+      PACKAGE_PIN G4 IOSTANDARD LVCMOS15, IO_L12N_T1_MRCC_35, Sch=cpu_resetn.
+      Bank 35 is the 1.5 V DDR3 bank, so LVCMOS15 is the standard the vendor
+      declares — unlike the AX7A200B reset, which is LVCMOS33.
+  led:
+    port: LED1
+    pin: T14
+    iostandard: LVCMOS25
+    provenance: >-
+      Digilent Nexys-Video-Master.xdc: PACKAGE_PIN T14 IOSTANDARD LVCMOS25,
+      IO_L15P_T2_DQS_13, Sch=led[0].
+
+peripherals:
+  uart:
+    chip: FT232R
+    interface: USB_micro
+    # Direction is stated from the FPGA's side, matching the top-level port names:
+    # `uart_rx` is an FPGA input, `uart_tx` an FPGA output.
+    fpga_rxd: V18
+    fpga_txd: AA19
+    iostandard: LVCMOS33
+    # What the USB descriptor says, versus what the operating system reports: the FTDI
+    # VCP driver appends the interface letter, so `serial_number` below is the one a
+    # session must match. Measured with pyserial on 2026-10-01:
+    #   COM4 0x0403:0x6001 'AV0KR4KQA' 'USB Serial Port (COM4)'
+    #   COM3 0x10c4:0xea60 'CA127350C9F9EF1187F562135C2A50C9'  <- the AX7A200B's, refused
+    host_serial_number: AV0KR4KQ
+    host_bridge:
+      chip: FT232R
+      usb_vid: "0403"
+      usb_pid: "6001"
+      serial_number: AV0KR4KQA
+      provenance: >-
+        Measured 2026-10-01: the FT232R enumerates as
+        USB\VID_0403&PID_6001\AV0KR4KQ with its serial port on COM4, alongside the
+        board's separate onboard Digilent USB-JTAG (FT2232H, 210276BA00BF). Declared
+        because `verify_board` refuses a capture whose bridge is not this board's: the
+        AX7A200B's CP2102 is 10c4:ea60 and would otherwise be accepted.
+    provenance: >-
+      Digilent Nexys-Video-Master.xdc: PACKAGE_PIN V18 IOSTANDARD LVCMOS33
+      [get_ports { uart_tx_in }] (IO_L14P_T2_SRCC_14) and PACKAGE_PIN AA19
+      IOSTANDARD LVCMOS33 [get_ports { uart_rx_out }] (IO_L15P_T2_DQS_RDWR_B_14).
+      Digilent names these from the FPGA's side, so uart_tx_in is the FPGA input
+      (the host's transmit line) and uart_rx_out is the FPGA output. Cross-checked
+      against part0_pins.xml: <pin index="43" name="usb_uart_rxd" ... loc="V18"/>
+      and <pin index="44" name="usb_uart_txd" ... loc="AA19"/>.
+    measured_host_port:
+      port: COM4
+      device: USB Serial Port (COM4)
+      instance: FTDIBUS\VID_0403+PID_6001+AV0KR4KQA\0000
+      when: 2026-10-01
+      note: >-
+        Advisory only, and re-measured every board session: the bridge enumerates
+        as a fresh FTDI device and its COM number is not a board fact. The
+        FPGA-side pins above are the board facts.
+
+jtag:
+  connector: onboard USB (Digilent USB-JTAG)
+  cable: Digilent Nexys Video 210276BA00BFB
+  cable_serial: 210276BA00BF
+  target_name: xc7a200t
+  mode: volatile
+  provenance: >-
+    Measured 2026-10-01: `jtag targets` lists
+    `2  Digilent Nexys Video 210276BA00BFB` with `3  xc7a200t (idcode 13636093
+    irlen 6 fpga)` under it. The FT2232H behind it enumerates as
+    USB\VID_0403&PID_6010\210276BA00BF. `target_name` is the die name the chain
+    reports, not the package-qualified part.
+  bench_note: >-
+    On 2026-10-01 a second cable (Digilent JTAG-HS1 210512180081, the AX7A200B's)
+    was still enumerating with a dead chain — xsdb reported
+    `(error DR shift through all ones)`. Selecting a target by die name alone is
+    therefore not enough on a two-cable bench; the target must be selected under
+    the named cable.
+
+host:
+  serial_port_hint: COM4
+  baudrate_note: >-
+    The UART bridge is an FT232R; the design runs it at the skills' verified
+    115200 baud. No board-specific override is declared, so the baudrate keeps the
+    `verified_default` provenance the AX7A200B evidence was measured with.
+
+constraints_available: true
+constraints_source: vendor_master_xdc
+deployment_notes: >
+  JTAG download via the onboard Digilent USB-JTAG port (volatile configuration).
+  QSPI Flash boots the FPGA on power-up, so a power cycle restores the flashed
+  image and a JTAG configuration is lost.
+  The 100 MHz system clock on R4 is single-ended LVCMOS33: the wrapper must use
+  IBUF, and an MMCM is kept in the path so the reset semantics that the AX7A200B
+  build relies on (`~rst_n | ~locked`) stay identical on both boards.
+
+unknowns:
+  - ddr3_pinout_table
+  - fmc_pinout_table
+  - qspi_flash_part_number
