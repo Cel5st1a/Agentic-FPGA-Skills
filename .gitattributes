@@ -1,0 +1,2 @@
+# Preserve the source snapshot byte-for-byte, including pinned RTL hashes.
+* -text
