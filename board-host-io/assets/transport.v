@@ -43,7 +43,7 @@ module cnn_uart_transport #(
     localparam integer TX_INDEX_BITS = (RESPONSE_TOTAL > 1) ? $clog2(RESPONSE_TOTAL) : 1;
     localparam [7:0] PAYLOAD_LOW = PAYLOAD_BYTES % 256;
     localparam [7:0] PAYLOAD_HIGH = (PAYLOAD_BYTES / 256) % 256;
-    localparam [7:0] RESPONSE_LENGTH = RESPONSE_BYTES + 4;
+    localparam [15:0] RESPONSE_LENGTH = RESPONSE_BYTES + 4;
     reg [3:0] state;
     reg [2:0] header_index;
     reg [PAYLOAD_INDEX_BITS-1:0] payload_index;
@@ -76,8 +76,8 @@ module cnn_uart_transport #(
                 1: response_byte = 8'ha5;
                 2: response_byte = sequence_id[7:0];
                 3: response_byte = sequence_id[15:8];
-                4: response_byte = RESPONSE_LENGTH;
-                5: response_byte = 0;
+                4: response_byte = RESPONSE_LENGTH[7:0];
+                5: response_byte = RESPONSE_LENGTH[15:8];
                 6, 7, 8, 9: response_byte = captured_cycles[(index-6)*8 +: 8];
                 RESPONSE_TOTAL-2: response_byte = tx_crc[7:0];
                 RESPONSE_TOTAL-1: response_byte = tx_crc[15:8];

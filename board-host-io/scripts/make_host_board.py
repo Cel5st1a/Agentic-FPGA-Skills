@@ -36,22 +36,24 @@ from pathlib import Path
 
 import yaml
 
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import board_facts  # noqa: E402
 import host_geometry  # noqa: E402
 
-
 SKILLS = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(SKILLS / "vivado-manager/scripts"))
+from stage_rtl import core_sources  # noqa: E402
+
 ASSETS = Path(__file__).resolve().parents[1] / "assets"
 #: Assets staged into a build. Edited deliberately, never incidentally: a mismatch fails
 #: closed before anything is written. `references/frozen/transport-96ceb796.v` is the
 #: differential reference for the parameterised transport and is never staged.
 SOURCE_HASHES = {
-    "transport.v": "79648c16aff5659d3bff6d554ae3a55adf75e312541e9e46b4d7d3dab719f056",
+    "transport_chunked.v": "176da90ff43f50389feb118b24b3ecaa20dd847a49f6ac61a7c29e84d7abece3",
+    "transport.v": "d3d613faf1578e8fba0450f1e024ecd0faad1752c17356dad5ab9d99acbdf09e",
     "uart_rx.v": "f5570b4c8f030694afd778d380b473b6987b7ef1f10e14dbeb762d4d4e3d5965",
     "uart_tx.v": "f72aa61750168dee3c8c874a8c4edb3aaa2573400a2ce7bea3c68062c4151974",
-    "host_stream_adapter.v": "216192b0d637ca92895c68595b2c6399c8d6565f08bdb5e3a301f34f43bb695a",
+    "host_stream_adapter.v": "46595f2c05bc56598d834d2f5fb5f16c68abc829bd052a16aa7592192be58468",
     "host_avld_adapter.v": "a72944d5e7296f04ee532519af102fd7cdb126a0293f4b1a2e34bb868966e5a2",
 }
 ADAPTER_FOR_MODE = {"parallel": "host_avld_adapter.v", "stream": "host_stream_adapter.v"}
@@ -71,7 +73,9 @@ def core_ports(path: Path, name: str) -> dict:
 
 def require_port(ports: dict, name: str, direction: str, bits: int) -> None:
     if ports.get(name) != {"direction": direction, "bits": bits}:
-        raise ValueError(f"core port {name} must be {direction} {bits} bits; found {ports.get(name)}")
+        raise ValueError(
+            f"core port {name} must be {direction} {bits} bits; found {ports.get(name)}"
+        )
 
 
 def validate_interface(record: dict, ports: dict, geometry: host_geometry.Geometry) -> str:
@@ -92,7 +96,8 @@ def validate_interface(record: dict, ports: dict, geometry: host_geometry.Geomet
         if len(outputs) != geometry.out_elements:
             raise ValueError(
                 f"core has {len(outputs)} result words, the geometry derives "
-                f"{geometry.out_elements}")
+                f"{geometry.out_elements}"
+            )
         for name in outputs:
             require_port(ports, name, "output", geometry.out_element_bits)
         return "parallel"
@@ -106,50 +111,61 @@ def validate_interface(record: dict, ports: dict, geometry: host_geometry.Geomet
         # The generated RTL's real port is the port width; the transport still moves the
         # whole payload. Geometry keeps payload_bytes = in_elements*element_bits/8, while
         # the adapter and this validation use the port width.
-        port_in_bits = stream["input_lanes_per_beat"] * stream["element_bits"]
-        for key, value in (("input_elements", geometry.in_elements),
-                           ("output_elements", geometry.out_elements),
-                           ("element_bits", geometry.in_element_bits),
-                           ("output_element_bits", geometry.out_element_bits),
-                           ("tdata_bits", port_in_bits),
-                           ("output_tdata_bits", geometry.out_bits)):
+        port_in_bits = stream["tdata_bits"]
+        port_out_bits = stream["output_tdata_bits"]
+        for key, value in (
+            ("input_elements", geometry.in_elements),
+            ("output_elements", geometry.out_elements),
+            ("element_bits", geometry.in_element_bits),
+            ("output_element_bits", geometry.out_element_bits),
+            ("tdata_bits", port_in_bits),
+            ("output_tdata_bits", port_out_bits),
+        ):
             if stream.get(key) != value:
-                raise ValueError(f"generated stream geometry has {key}={stream.get(key)}, "
-                                 f"the wrapper records {value}")
+                raise ValueError(
+                    f"generated stream geometry has {key}={stream.get(key)}, "
+                    f"the wrapper records {value}"
+                )
         for key, direction, bits in (
-            ("input_port", "input", port_in_bits), ("input_valid", "input", 1),
-            ("input_ready", "output", 1), ("output_port", "output", geometry.out_bits),
-            ("output_valid", "output", 1), ("output_ready", "input", 1),
+            ("input_port", "input", port_in_bits),
+            ("input_valid", "input", 1),
+            ("input_ready", "output", 1),
+            ("output_port", "output", port_out_bits),
+            ("output_valid", "output", 1),
+            ("output_ready", "input", 1),
         ):
             require_port(ports, interface[key], direction, bits)
         for side, element_bits, integer_bits in (
-                ("input", geometry.in_element_bits, geometry.in_integer_bits),
-                ("output", geometry.out_element_bits, geometry.out_integer_bits)):
+            ("input", geometry.in_element_bits, geometry.in_integer_bits),
+            ("output", geometry.out_element_bits, geometry.out_integer_bits),
+        ):
             element = interface["element_types"][side]
             if (element["total_bits"], element["integer_bits"]) != (element_bits, integer_bits):
                 raise ValueError(
                     f"generated {side} element grid ap_fixed<{element['total_bits']},"
                     f"{element['integer_bits']}> disagrees with the derived "
-                    f"ap_fixed<{element_bits},{integer_bits}>")
+                    f"ap_fixed<{element_bits},{integer_bits}>"
+                )
         return "stream"
     raise ValueError(f"unsupported interface style {style}")
 
 
-def render_top(record: dict, mode: str, geometry: host_geometry.Geometry,
-               facts: board_facts.BoardFacts) -> str:
+def render_top(
+    record: dict, mode: str, geometry: host_geometry.Geometry, facts: board_facts.BoardFacts
+) -> str:
     interface = record["interface"]
     # The core's actual input PORT is one beat wide; the whole sample may take several
     # beats (see docs/deployment-recovery.md). Derived from the recorded wrapper, not
     # from the payload width.
-    port_in_bits = (interface["stream"]["input_lanes_per_beat"]
-                    * interface["stream"]["element_bits"]) if mode == "stream" else geometry.in_bits
+    port_in_bits = interface["stream"]["tdata_bits"] if mode == "stream" else geometry.in_bits
     clock = record["clock"]
     core_mhz = int(round(float(clock["core_mhz"])))
     clock_ports = facts.clock_ports
     if facts.clock_kind == "differential":
         clock_declaration = f"input wire {clock_ports[0]}, input wire {clock_ports[1]}"
-        clock_input = (f"    IBUFDS ref_input(.I({clock_ports[0]}), .IB({clock_ports[1]}), "
-                       f".O(refclk));")
+        clock_input = (
+            f"    IBUFDS ref_input(.I({clock_ports[0]}), .IB({clock_ports[1]}), .O(refclk));"
+        )
     else:
         clock_declaration = f"input wire {clock_ports[0]}"
         clock_input = f"    IBUF ref_input(.I({clock_ports[0]}), .O(refclk));"
@@ -160,7 +176,12 @@ def render_top(record: dict, mode: str, geometry: host_geometry.Geometry,
     transport_parameters = (
         f".CLK_HZ({core_mhz * 1000000}), .PAYLOAD_BYTES({geometry.payload_bytes}), "
         f".RESPONSE_BYTES({geometry.response_bytes}), .INPUT_BITS({geometry.in_words_bits}), "
-        f".OUTPUT_BITS({geometry.out_words_bits})")
+        f".OUTPUT_BITS({geometry.out_words_bits})"
+    )
+    transport_module = "cnn_uart_transport"
+    if geometry.framing == "chunked_v1":
+        transport_module = "cnn_uart_chunk_transport"
+        transport_parameters += f", .CHUNK_BYTES({geometry.chunk_bytes})"
     adapter = ""
     if mode == "parallel":
         core_connections = [
@@ -174,7 +195,8 @@ def render_top(record: dict, mode: str, geometry: host_geometry.Geometry,
         core_connections += [
             f".{name}(core_output[{(index + 1) * geometry.out_element_bits - 1}:"
             f"{index * geometry.out_element_bits}])"
-            for index, name in enumerate(interface["result_outputs"])]
+            for index, name in enumerate(interface["result_outputs"])
+        ]
         if "ap_idle" in interface.get("control", []):
             core_connections.append(".ap_idle(ap_idle)")
         if "ap_ready" in interface.get("control", []):
@@ -208,6 +230,12 @@ def render_top(record: dict, mode: str, geometry: host_geometry.Geometry,
         for name in ("ap_idle", "ap_ready"):
             if name in interface.get("control", []):
                 core_connections.append(f".{name}()")
+        input_beats = interface["stream"]["input_beats_per_sample"]
+        output_beats = interface["stream"]["output_beats_per_sample"]
+        port_out_bits = interface["stream"]["output_tdata_bits"]
+        output_slot_bits = interface["stream"].get(
+            "output_lane_bits", interface["stream"]["lane_bits"]
+        )
         adapter = f"""
     wire core_start, core_rst_n, m_tvalid, m_tready, s_tvalid, s_tready;
     // The transport carries the whole-sample payload ({geometry.in_words_bits} bits); the
@@ -215,11 +243,18 @@ def render_top(record: dict, mode: str, geometry: host_geometry.Geometry,
     // handed over INPUT_BEATS beats (see docs/deployment-recovery.md).
     wire [{geometry.in_words_bits - 1}:0] input_words_full;
     wire [{port_in_bits - 1}:0] m_tdata;
-    wire [{geometry.out_bits - 1}:0] s_tdata;
+    wire [{port_out_bits - 1}:0] s_tdata;
     host_stream_adapter #(.INPUT_WORDS_BITS({geometry.in_words_bits}),
                           .PORT_BITS({port_in_bits}),
                           .OUTPUT_BITS({geometry.out_bits}),
-                          .INPUT_BEATS({interface['stream']['input_beats_per_sample']})) stream_adapter(
+                          .OUTPUT_PORT_BITS({port_out_bits}), .OUTPUT_BEATS({output_beats}),
+                          .INPUT_ELEMENT_BITS({geometry.in_element_bits}),
+                          .OUTPUT_ELEMENT_BITS({geometry.out_element_bits}),
+                          .INPUT_LANES({interface["stream"]["input_lanes_per_beat"]}),
+                          .OUTPUT_LANES({interface["stream"]["output_lanes_per_beat"]}),
+                          .INPUT_SLOT_BITS({interface["stream"]["lane_bits"]}),
+                          .OUTPUT_SLOT_BITS({output_slot_bits}),
+                          .INPUT_BEATS({input_beats})) stream_adapter(
         .clk(clk), .rst_n(internal_rst_n), .start(start),
         .input_words(input_words_full), .done(done), .output_words(output_words),
         .core_rst_n(core_rst_n),
@@ -242,9 +277,9 @@ module board_top(
 );
     wire refclk, clk_raw, feedback_raw, feedback, clk, locked;
 {clock_input}
-    MMCME2_BASE #(.CLKIN1_PERIOD({1000.0/clock['reference_mhz']}),
-                 .CLKFBOUT_MULT_F({clock['mmcm_mult']}), .DIVCLK_DIVIDE(1),
-                 .CLKOUT0_DIVIDE_F({clock['mmcm_divide']})) clock_generator (
+    MMCME2_BASE #(.CLKIN1_PERIOD({1000.0 / clock["reference_mhz"]}),
+                 .CLKFBOUT_MULT_F({clock["mmcm_mult"]}), .DIVCLK_DIVIDE(1),
+                 .CLKOUT0_DIVIDE_F({clock["mmcm_divide"]})) clock_generator (
         .CLKIN1(refclk), .CLKFBIN(feedback), .CLKFBOUT(feedback_raw),
         .CLKOUT0(clk_raw), .LOCKED(locked), .PWRDWN(1'b0), .RST(~rst_n));
     BUFG feedback_buffer(.I(feedback_raw), .O(feedback));
@@ -266,14 +301,14 @@ module board_top(
     uart_tx #(.CLK_FRE({core_mhz}), .BAUD_RATE({geometry.baudrate})) transmitter(
         .clk(clk), .rst_n(internal_rst_n), .tx_pin(uart_tx),
         .tx_data(tx_data), .tx_data_valid(tx_valid), .tx_data_ready(tx_ready));
-    cnn_uart_transport #({transport_parameters}) transport(
+    {transport_module} #({transport_parameters}) transport(
         .clk(clk), .rst_n(internal_rst_n),
         .uart_rx_data(rx_data), .uart_rx_valid(rx_valid),
         .uart_tx_data(tx_data), .uart_tx_valid(tx_valid), .uart_tx_ready(tx_ready),
         .input_words(input_words), .start(start), .done(done),
         .output_words(output_words));
 {adapter}
-    {record['top']} accelerator(
+    {record["top"]} accelerator(
         {joined});
 endmodule
 """
@@ -288,30 +323,43 @@ def render_xdc(facts: board_facts.BoardFacts) -> str:
     blanket line that would only be right for one of them.
     """
     clock_ports = facts.clock_ports
-    lines = ["set_property CFGBVS VCCO [current_design]",
-             "set_property CONFIG_VOLTAGE 3.3 [current_design]"]
-    lines += [f"set_property PACKAGE_PIN {pin} [get_ports {port}]"
-              for port, pin in zip(clock_ports, facts.clock_pins)]
-    lines.append(f"set_property IOSTANDARD {facts.clock_iostandard} "
-                 f"[get_ports {{{' '.join(clock_ports)}}}]")
-    lines.append(f"create_clock -name board_ref -period {1000.0/facts.reference_mhz:.3f} "
-                 f"[get_ports {clock_ports[0]}]")
+    lines = [
+        "set_property CFGBVS VCCO [current_design]",
+        "set_property CONFIG_VOLTAGE 3.3 [current_design]",
+    ]
+    lines += [
+        f"set_property PACKAGE_PIN {pin} [get_ports {port}]"
+        for port, pin in zip(clock_ports, facts.clock_pins, strict=True)
+    ]
+    lines.append(
+        f"set_property IOSTANDARD {facts.clock_iostandard} [get_ports {{{' '.join(clock_ports)}}}]"
+    )
+    lines.append(
+        f"create_clock -name board_ref -period {1000.0 / facts.reference_mhz:.3f} "
+        f"[get_ports {clock_ports[0]}]"
+    )
     lines.append(f"set_property PACKAGE_PIN {facts.reset_pin} [get_ports rst_n]")
     lines.append(f"set_property PACKAGE_PIN {facts.uart_rx_pin} [get_ports uart_rx]")
     lines.append(f"set_property PACKAGE_PIN {facts.uart_tx_pin} [get_ports uart_tx]")
     groups: dict[str, list[str]] = {}
-    for port, standard in (("rst_n", facts.reset_iostandard),
-                           ("uart_rx", facts.uart_iostandard),
-                           ("uart_tx", facts.uart_iostandard)):
+    for port, standard in (
+        ("rst_n", facts.reset_iostandard),
+        ("uart_rx", facts.uart_iostandard),
+        ("uart_tx", facts.uart_iostandard),
+    ):
         groups.setdefault(standard, []).append(port)
     for standard, ports in groups.items():
         lines.append(f"set_property IOSTANDARD {standard} [get_ports {{{' '.join(ports)}}}]")
-    lines += ["set_false_path -from [get_ports rst_n]",
-              "set_false_path -from [get_ports uart_rx]",
-              "set_false_path -to [get_ports uart_tx]"]
-    header = (f"# Source: {facts.profile_path} ({facts.board_id}, {facts.part}). Board-facing\n"
-              f"# pins, I/O standards and clock topology are read from this profile at build\n"
-              f"# time; no pin is remembered in code.\n")
+    lines += [
+        "set_false_path -from [get_ports rst_n]",
+        "set_false_path -from [get_ports uart_rx]",
+        "set_false_path -to [get_ports uart_tx]",
+    ]
+    header = (
+        f"# Source: {facts.profile_path} ({facts.board_id}, {facts.part}). Board-facing\n"
+        f"# pins, I/O standards and clock topology are read from this profile at build\n"
+        f"# time; no pin is remembered in code.\n"
+    )
     return header + "\n".join(lines) + "\n"
 
 
@@ -324,6 +372,9 @@ def generate(source_wrapper: Path, output: Path) -> dict:
     core = Path(record["core_verilog"])
     if sha256_file(core) != record["core_verilog_sha256"]:
         raise ValueError("source wrapper's core Verilog hash disagrees with the file")
+    core_manifest = core_sources(core)
+    if "core_source_manifest" in record and record["core_source_manifest"] != core_manifest:
+        raise ValueError("source wrapper's core source manifest disagrees with the files")
     deployment = Path(record["contract"])
     contract = yaml.safe_load(deployment.read_text(encoding="utf-8-sig"))
     model_path = (deployment.parent / contract["model"]["path"]).resolve()
@@ -332,7 +383,9 @@ def generate(source_wrapper: Path, output: Path) -> dict:
     starting_path = run_dir / "starting-state.json"
     if starting_path.is_file():
         starting = json.loads(starting_path.read_text(encoding="utf-8"))
-        frozen = (starting.get("model_files") or {}).get(contract["model"]["path"], {}).get("sha256")
+        frozen = (
+            (starting.get("model_files") or {}).get(contract["model"]["path"], {}).get("sha256")
+        )
         if frozen != model_sha256:
             raise ValueError("model file differs from the bootstrap starting-state hash")
     profile_path = Path((record.get("board") or {}).get("pins_profile") or "")
@@ -346,27 +399,38 @@ def generate(source_wrapper: Path, output: Path) -> dict:
     facts = board_facts.load_facts(profile, profile_path)
     board_facts.require_recorded_board(record.get("board") or {}, facts)
     if record.get("part") != facts.part:
-        raise ValueError(f"generated core targets {record.get('part')}, the board profile "
-                         f"declares {facts.part}")
+        raise ValueError(
+            f"generated core targets {record.get('part')}, the board profile declares {facts.part}"
+        )
     reference_mhz = facts.reference_mhz
     if float(record["clock"]["reference_mhz"]) != float(reference_mhz):
-        raise ValueError(f"generated core assumes a {record['clock']['reference_mhz']} MHz "
-                         f"reference clock, the board profile declares {reference_mhz} MHz")
+        raise ValueError(
+            f"generated core assumes a {record['clock']['reference_mhz']} MHz "
+            f"reference clock, the board profile declares {reference_mhz} MHz"
+        )
     expected_core_mhz = 1000.0 / float(contract["clock_period_ns"])
     if abs(float(record["clock"]["core_mhz"]) - expected_core_mhz) > 1e-6:
-        raise ValueError(f"generated core runs at {record['clock']['core_mhz']} MHz, the "
-                         f"contract's clock_period_ns derives {expected_core_mhz} MHz")
-    if facts.core_frequency_mhz is not None and \
-            abs(float(facts.core_frequency_mhz) - expected_core_mhz) > 1e-6:
-        raise ValueError(f"the board profile {profile_path} declares core_frequency_mhz="
-                         f"{facts.core_frequency_mhz}, the contract's clock_period_ns derives "
-                         f"{expected_core_mhz} MHz")
-    geometry = host_geometry.geometry_for_wrapper(deployment, contract, record,
-                                                  board_profile=profile)
+        raise ValueError(
+            f"generated core runs at {record['clock']['core_mhz']} MHz, the "
+            f"contract's clock_period_ns derives {expected_core_mhz} MHz"
+        )
+    if (
+        facts.core_frequency_mhz is not None
+        and abs(float(facts.core_frequency_mhz) - expected_core_mhz) > 1e-6
+    ):
+        raise ValueError(
+            f"the board profile {profile_path} declares core_frequency_mhz="
+            f"{facts.core_frequency_mhz}, the contract's clock_period_ns derives "
+            f"{expected_core_mhz} MHz"
+        )
+    geometry = host_geometry.geometry_for_wrapper(
+        deployment, contract, record, board_profile=profile
+    )
     ports = core_ports(core, record["top"])
     mode = validate_interface(record, ports, geometry)
     top_text, xdc_text = render_top(record, mode, geometry, facts), render_xdc(facts)
-    extra = ["transport.v", "uart_rx.v", "uart_tx.v", ADAPTER_FOR_MODE[mode]]
+    transport_asset = "transport_chunked.v" if geometry.framing == "chunked_v1" else "transport.v"
+    extra = [transport_asset, "uart_rx.v", "uart_tx.v", ADAPTER_FOR_MODE[mode]]
     for name, digest in SOURCE_HASHES.items():
         if sha256_file(ASSETS / name) != digest:
             raise ValueError(f"verified RTL asset hash mismatch: {name}")
@@ -377,24 +441,36 @@ def generate(source_wrapper: Path, output: Path) -> dict:
         shutil.copyfile(ASSETS / name, output / name)
     # The host has no ROM, but its input element grid retains the producer's provenance.
     record["rom_image"] = {"grid": record["rom_image"]["grid"]}
-    record.update({
-        "skill": "board-host-io", "source_wrapper": str(source_wrapper),
-        "source_wrapper_sha256": sha256_file(source_wrapper),
-        "model_path": str(model_path), "model_sha256": model_sha256,
-        "top_ports": list(facts.host_ports),
-        "host_board_facts": facts.to_record(),
-        "host_input_output_available": True,
-        "input_source": "UART request payload",
-        "outputs": ["board_top.v", "board.xdc", *extra],
-        "notes": "Host UART board variant; no sample ROM. Hardware numerical verification is NOT_RUN.",
-        "verification_scope": "host-path-built-unverified",
-        "on_board_numerical": "NOT_RUN", "programmed": False,
-        "hardware_verified": False, "extra_rtl": extra,
-        "host_geometry": geometry.to_dict(),
-        "host_protocol": host_geometry.protocol_record(geometry),
-        "generated_sources": {name: sha256_file(output / name)
-                              for name in ["board_top.v", "board.xdc", *extra]},
-    })
+    record.update(
+        {
+            "skill": "board-host-io",
+            "source_wrapper": str(source_wrapper),
+            "source_wrapper_sha256": sha256_file(source_wrapper),
+            "core_source_manifest": core_manifest,
+            "core_manifest_scope": "source files observed at host generation",
+            "model_path": str(model_path),
+            "model_sha256": model_sha256,
+            "top_ports": list(facts.host_ports),
+            "host_board_facts": facts.to_record(),
+            "host_input_output_available": True,
+            "input_source": "UART request payload",
+            "outputs": ["board_top.v", "board.xdc", *extra],
+            "notes": (
+                "Host UART board variant; no sample ROM. "
+                "Hardware numerical verification is NOT_RUN."
+            ),
+            "verification_scope": "host-path-built-unverified",
+            "on_board_numerical": "NOT_RUN",
+            "programmed": False,
+            "hardware_verified": False,
+            "extra_rtl": extra,
+            "host_geometry": geometry.to_dict(),
+            "host_protocol": host_geometry.protocol_record(geometry),
+            "generated_sources": {
+                name: sha256_file(output / name) for name in ["board_top.v", "board.xdc", *extra]
+            },
+        }
+    )
     (output / "wrapper.json").write_text(json.dumps(record, indent=2), encoding="utf-8")
     return record
 
@@ -405,10 +481,18 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     record = generate(args.source_wrapper, args.output)
-    print(json.dumps({"board": str(args.output), "top_ports": record["top_ports"],
-                      "mode": record["interface"]["style"],
-                      "host_protocol": record["host_protocol"],
-                      "hardware_verified": False}, indent=2))
+    print(
+        json.dumps(
+            {
+                "board": str(args.output),
+                "top_ports": record["top_ports"],
+                "mode": record["interface"]["style"],
+                "host_protocol": record["host_protocol"],
+                "hardware_verified": False,
+            },
+            indent=2,
+        )
+    )
     return 0
 
 

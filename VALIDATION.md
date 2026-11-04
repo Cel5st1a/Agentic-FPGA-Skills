@@ -1,41 +1,13 @@
-# Publication validation — 2026-10-22
+# S15-opt4 validation
 
-Environment: Windows, PowerShell, existing Python virtual environment at
-`D:/Agentic_FPGA_Deployment/.venv/Scripts/python.exe`. These checks exercised the
-publication copy, not the source tree. No EDA tools or FPGA hardware were operated.
+Development environment Windows, Python 3.13, g++ (MinGW). Exact hls4ml 1.3.0 Vitis pooling template used for hash and idempotence checks.
 
-| Check | Result |
-| --- | --- |
-| Top-level skill count | 15 |
-| YAML frontmatter parsing | All 15 parsed successfully with PyYAML |
-| SHA-256 comparison with source | All 120 copied files match `SOURCE-MANIFEST.json` |
-| Credential pattern scan | No matches for GitHub token, private-key header or quoted long API-secret assignment patterns; this is a limited pattern scan, not a guarantee |
-| CLI `--help` | `scripts/line/run_line.py` and `board-host-io/scripts/verify_board.py` succeeded |
-| Selected pytest suite | 61 passed in 2.63 seconds |
-| Ruff default check | Failed: 45 existing findings; source scripts were preserved |
+17 targeted regressions pass, including compiled C++ explicit pooling vs independent window maximum at 2x2x1, 5x7x3, 11x11x16, 28x28x8, 32x32x4, three frames each, negative values and fallback for average pooling. Count validation covers 1/100/256/257 and invalid count types.
 
-Pytest command (from repository root):
+Ruff syntax and undefined-local checks pass across all skills. Historical strict formatting/import warnings are retained. Full suite uses existing private development parser fixtures locally; those fixtures are excluded from this repository.
 
-```powershell
-python -m pytest tests/test_bringup_line.py tests/test_rom_package_board.py board-host-io/tests/test_host_geometry.py board-host-io/tests/test_protocol_geometry.py reuse-factor-resource-tuning/scripts/test_tune_reuse_factor.py -q
-```
+Historical hardware evidence is from opt3 run-local repairs, not a formal opt4 board retest. opt4 source enables a structural dispatcher and local frame counters and needs future board regression to measure deployment benefit. No speedup claim is made.
 
-This selected suite checks contract/bootstrap behavior, packaging, host geometry,
-protocol encoding and reuse-factor analysis. The complete test tree was not run;
-some tests depend on historical local artifacts or AMD xsim.
+Full inherited suite passed 226 tests in 185.61 seconds with development fixtures. Exact-template targeted suite passed 17 tests. The full suite completed before adding the final exact-template test.
 
-Ruff command: `ruff check . --output-format json`. Findings by rule:
-
-| Rule | Count |
-| --- | ---: |
-| F401 | 20 |
-| E402 | 9 |
-| F811 | 8 |
-| F841 | 4 |
-| E731 | 2 |
-| F541 | 2 |
-
-There were no code changes in this publication copy. README, license, third-party
-notices, ignore rules, this validation record and the source hash manifest were
-added for distribution. Historical archives and local workflow records were
-excluded as described in README. No new hardware-verification claim is made.
+Additional integration check generated an actual odd 5x7x3 Keras MaxPooling model with hls4ml 1.3.0/Vitis, applied the pinned repair, compiled the generated top and ap_fixed types with MinGW g++, and checked three consecutive frames exactly against independent window maxima. The upstream POSIX build_lib.sh entry failed under Windows cmd; the direct generated C++ top compilation passed. No HLS synthesis, RTL run or hardware retest was performed for opt4.

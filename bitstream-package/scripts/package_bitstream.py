@@ -889,4 +889,16 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Select by the actual generated host wrapper, retaining each legacy audit.
+    import argparse
+    import subprocess
+
+    selector = argparse.ArgumentParser(add_help=False)
+    selector.add_argument("--run", type=Path)
+    selected, _ = selector.parse_known_args()
+    if selected.run and (selected.run / "p3-build/host-board/wrapper.json").is_file():
+        sys.exit(subprocess.call([
+            sys.executable, str(Path(__file__).with_name("package_host_bitstream.py")),
+            *sys.argv[1:],
+        ]))
     sys.exit(main())

@@ -10,6 +10,29 @@ allowed-tools: Bash, Read, Grep, Glob
 
 # Log Analyzer
 
+opt3在现有Python摘要上增加生成表/接口诊断：`--parameters`、`--defines`、
+`--activation-header`、`--wrapper`。字段和限制见[工具说明](../docs/opt3-tools.md)。
+表位数乘积与源码展开上界不等于物理BRAM/端口，不自动选表深、RF或取消运行。
+未知模板、类型或报告保持null，资源与时序诊断不否定已成立的板端数值成功。
+
+## opt2 efficiency snapshot (Python, no Bash or EDA required)
+
+For slow implementation or candidate comparison, use existing artifacts:
+
+```powershell
+python scripts/analyze_efficiency.py --utilization <actual utilization_synth.rpt> --log <actual vivado.log> --out <new analysis.json>
+```
+
+Both input flags may repeat for several attempts. Output preserves each input hash and
+actual design state. Missing counts are null; measured zero stays zero. Phase times are
+cumulative tool times, not additive per-stage durations. Resource fractions do not reject
+an otherwise accepted model. Overlap trends do not prove convergence or a stall. Use
+PID+birth/CPU/log timestamps for liveness; this tool never stops, retries or starts EDA.
+Global counts cannot name the dominant layer; use existing hierarchy/RTL evidence before
+choosing RF, table, precision or shell changes. See the timing skill for affected stages.
+Keep diagnostics bounded: extract relevant error/phase/path slices, avoid repeated full
+logs or complete generated headers in prompts, and retain raw artifacts for later audit.
+
 ## Purpose
 Quickly parse FPGA+AI toolchain logs and extract actionable error information
 with prioritized fix recommendations. Reduce log-diving from minutes to seconds.
@@ -23,7 +46,7 @@ with prioritized fix recommendations. Reduce log-diving from minutes to seconds.
 
 ## When NOT to Use
 - Warnings without errors (informational only)
-- Performance analysis (use `timing-closure-debugger`)
+- Choosing a physical repair from aggregate counts alone (use `timing-closure-debugger`)
 - Resource analysis (use `resource-estimator`)
 
 ## Execution

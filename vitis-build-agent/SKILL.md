@@ -11,7 +11,12 @@ allowed-tools: Bash, Read, Grep, Glob, Write
 
 # Vitis Build Agent
 
-按 [转换与上板恢复规则](../docs/deployment-recovery.md) 保留失败现场、检查 po2 中间类型、记录真实阶段状态并验证代理完成证据。对调度/流水候选核对实际 RTL 与 CSynth XML；选项接受或文件哈希变化不等于结构生效。数值失败停止后续阶段；不得放宽冻结容差或盲目增宽所有层。
+S15-opt：以 [ORDER.md](../ORDER.md) 的用户标准为准。cosim 仅显式诊断，阶段执行不默认
+设置墙钟上限。每次使用新的 work 目录；日志按本次开始时间检查，旧结果不冒充本次输出。
+当前生成模板内嵌阶段默认值；run_stage会在该默认块后显式读取build_opt.tcl，并保存实际
+build-prj.tcl与stage_option_binding。只写出选项文件不能证明已被模板消费；未知模板绑定保持未知。
+
+按 [转换与上板恢复规则](../docs/deployment-recovery.md) 保留失败现场、检查 po2 中间类型、记录真实阶段状态并验证代理完成证据。对调度/流水候选核对实际 RTL 与 CSynth XML；选项接受或文件哈希变化不等于结构生效。开发数值失败应定位实际偏差，不冒称有效模型；它不是独立于原Python板端比较的额外门槛。不得放宽用户容差或盲目增宽所有层。
 
 ## Purpose
 Execute and monitor Vitis HLS builds with automatic failure detection and
@@ -53,15 +58,14 @@ Generates RTL, estimates resources and timing.
 ### 3. Co-Simulation (cosim, explicit diagnostic only)
 
 This project has no successful traced-RTL cosim evidence. The default line excludes it;
-`boardsim` supplies the per-value numerical RTL gate. Only request cosim explicitly:
+`boardsim` is optional per-value RTL development diagnosis, not a board acceptance gate. Only request cosim explicitly:
 
 ```bash
 python scripts/run_stage.py --stage cosim --project <hls-project> --work <cosim-work> \
-    --deployment <deployment.yaml> --timeout 300
+    --deployment <deployment.yaml>
 ```
 
-`run_line.py --stages cosim` uses a 300-second diagnostic budget by default
-(`--timeout-cosim` overrides it). A C-wrapper-only result remains `NOT_RUN`, never RTL
+No default wall-clock limit is imposed; use an explicit timeout only when requested. A C-wrapper-only result remains `NOT_RUN`, never RTL
 `PASSED`. Keep its evidence even on timeout; do not retry to conceal a failed stage.
 
 ### 4. Implementation (impl)

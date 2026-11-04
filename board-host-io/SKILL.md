@@ -5,21 +5,65 @@ description: Use when a profile-bound hls4ml board build needs UART host input/o
 
 # Board host I/O and numerical verification
 
-This skill turns an already verified HLS core into a separate UART board variant. Its byte transport and UART RTL are copied byte-for-byte from the board-verified `cnn-board-03` run. Both adapters require fresh RTL, simulation and hardware evidence. The old bitstream proves only the old single-convolution model; it does not verify a frozen two-convolution encoder or any MLP.
+opt3宽流式适配器在握手接受拍后固定移动数据，避免全样本的运行时变址选择/写入；
+代价是额外输入移位寄存器。先看已有层级报告，不能从源码推定实际面积或时序提升。
+`build_host.py --start-stage impl|bitstream --prior-evidence <previous-stage.json>
+--continuation-board <fresh-same-run-dir>` 在新目录续作最小剩余阶段，原`--board`保留。
+必须有同组前阶段成功证据、checkpoint/RTL/约束/契约哈希和完整复用身份；
+旧记录身份未知时先检查现存证据，不默认跳过阶段，不为可选诊断重跑已验收模型。
+使用范围和参数见 [opt3工具说明](../docs/opt3-tools.md)。
+
+S15-opt 当前规则见 [ORDER.md](../ORDER.md)：256 条完整板端输出仅按原 Python
+`abs(error)<=.001+.001*abs(ref)` 判断；HLS 对照是可选诊断，真实采集与模型身份仍须有证据。
+本版 transport 响应长度支持完整 16 位字段，512 维输出已做 RTL/主机解码回归；
+单包保留16位长度；完整样本超过单包容量时自动选chunked_v1，按32位样本extent分块，
+短尾块与跨块元素保留。显式single超限仍拒绝，不截断。此修改尚未进行新模型上板验证，不能继承旧 bit 的证明。
+08:00 修复增加整拍多拍输出聚合：实际端口位宽与整份样本位宽分别记录，
+按输出窗口序号归属请求，全部输出拍及输入拍完成后才结束。开发 RTL 覆盖
+2/3/32 输出拍、每拍 1/2/4 元素、背压、间断及提前输出；不是原模型上板证据。
+输入或输出元素不能整除生成核心声明的 lane 数时仍明确拒绝；不猜核的尾拍/补零语义。
+输入/输出各自的有效W/I来自同一生成header/defines/bridge与hash；物理槽位宽度可分别填充。
+host适配只在槽位低位放实际元素，高位符号扩展；输出忽略填充位。有效类型文件变化需更新来源。
+
+新生成 host wrapper 记录 `core_source_manifest`：同目录下实际暂存的
+`.v/.sv/.dat/.mem/.hex` 全部文件名及哈希。构建/仿真暂存前校验清单，
+缺失、增加或内容变化需保留旧尝试并更新依赖记录，不能只认主顶层文件哈希。
+旧记录没有清单时明确标作 `UNRECORDED_LEGACY`，不补造历史证明。
+`stage_rtl.dependency_delta` 只比较核心与包装 RTL 内容范围：包装变化不标记核心仿真失效，
+核心变化则标记相关下游。它不判断模型、配置、工具版本是否匹配，不自动跳过构建或宣称可安全复用。
+
+可选 `wrapper.reuse_inputs` 包含产生阶段的 `arithmetic_config`（part/clock_period_ns/io_type/
+hls_config）、`tool_versions`（python/frontend_runtime/hls4ml/hls/vivado）及明确列出的
+`arithmetic_files` 路径映射时，`stage_rtl` 会重新读取实际依赖并附带 `reuse_identity`。
+模型/关联权重、算术配置/源码或HLS工具变化，即使RTL字节未变，嵌套的
+`dependency_delta.reuse_identity_comparison` 仍会标记核心身份不匹配；只改Vivado或包装留在包装域。
+外层 `affected_stages` 仍只说明RTL差异，必须同时读取嵌套身份判断。未提供元数据的旧记录为未知，
+不因这项优化拒绝原有构建。身份相同不等于已验证核心有效，不自动迁移/跳过工件。
+
+采集事件增加 `observed_at_utc` 和本次采集起点以来的单调时钟耗时。`summary.timing`
+分别记录完整 Python 数值比较通过的观测上界、采集处理结束和两者之间的主机耗时；
+不是板端计算结束的精确时刻，也不是内核延迟。失败时通过时刻为 null。
+SDK/报告/owner清理结束来自外部流程，采集器不知道时保持 null。
+`verify_board.earliest_success_observation` 仅选择已有合格记录的最早观测上界，
+不验证硬件来源；裸成功文本、无时区或损坏时间不参与选择，精确首pass时刻不推造。
+
+This skill turns an HLS core into a separate UART board variant. The UART RTL comes from
+the earlier board-verified run; the transport length extension is a new software/RTL repair.
+The old bitstream proves only its original model, never this version or a new model.
 
 Read [references/provenance.md](references/provenance.md) when judging whether prior board evidence applies to a model or bitstream.
 
 ## Supported boundary
 
-**One authoritative source per geometry fact: the producer records it; downstream stages read and validate it. Never re-derive hardware geometry from contract shapes or reference rows.** Contract `precision` constrains the frozen numerical criterion and must equal the recorded input/output grids; it cannot fill a missing grid. Agents read and check records, not invent packing rules.
+**One authoritative source per geometry fact: the producer records it; downstream stages read and validate it. Never re-derive hardware geometry from contract shapes or reference rows.** Input/output grids come from hash-bound generated type sources, independently of requested global precision. Legacy records without those sources retain declaration cross-checks; a requested precision cannot fill a missing grid. Agents read and check records, not invent packing rules.
 
 | Geometry | Authoritative field | Cross-check |
 | --- | --- | --- |
 | Input element count/order | ROM wrapper `input_layout.elements/flatten` | `c_order`, interface count, actual core port width and sample layout |
 | Output element count/order | New wrapper `output_layout.elements/flatten` | AXIS `interface.stream.output_elements`; validated ap_vld scalar-port mapping |
-| Input element grid | `rom_image.grid` | contract precision; AXIS `element_types.input` |
-| Output element grid | `output_grid` | contract precision; AXIS `element_types.output`; ap_vld result port widths |
-| Lane, beat and TDATA geometry | `interface.stream` | input beats = input elements / input lanes (exact division); single output beat; lane width equals element width; byte-aligned actual TDATA port |
+| Input element grid | `rom_image.grid` | hash-bound firmware type; AXIS `element_types.input` |
+| Output element grid | `output_grid` | hash-bound firmware type; AXIS `element_types.output`; ap_vld result port widths |
+| Lane, beat and TDATA geometry | `interface.stream` | input/output beats = respective elements / respective lanes (exact division); each physical slot is at least its actual element width; input/output slot widths are independent; byte-aligned actual TDATA port |
 | UART payload/frame/bus sizes, scales, baudrate | materialised host `host_geometry` | internal relationships and `host_protocol` projection; never replace fields with recomputed values |
 
 Only two legacy output-count rules are allowed: read AXIS `stream.output_elements`; or validate a nonempty, unique, ordered ap_vld `result_outputs` list with every `output_bits` equal to one output element, then apply one scalar per port. This rule does not support packed multi-element output ports. Missing `input_layout` or `output_grid` must fail with the field, expected rule and actual value: regenerate records in a **new run**, never patch an old record from shape, precision or references. Unknown interface styles require a new explicit, tested interface rule.
@@ -58,7 +102,7 @@ Which adapter sits between the transport and the core is decided by the core's *
 
 `io_serial` produces no third line: hls4ml gives it either array or stream ports, and it lands in whichever row above matches.
 
-For measured Vitis dataflow stream cores, the adapter keeps the core running with zero-valued idle windows. A request occupies a complete `INPUT_BEATS`-beat window; its output is identified by that window's ordinal. The transport holds the payload stable until done. The adapter switches into injection only after accepting the last idle beat, and advances its narrow slice only on handshake. Single-beat callers retain the `INPUT_BITS` parameter. The actual-core host integration simulation checks every contract row; a new core must demonstrate ordered one-output-per-input-window behavior before this policy is reused. See [recovery rules](../docs/deployment-recovery.md).
+For ordered Vitis dataflow stream cores, the adapter keeps the core running with zero-valued idle windows. A request occupies a complete `INPUT_BEATS`-beat window; its `OUTPUT_BEATS` output beats are identified by that window's ordinal and aggregated in order. The transport holds the payload stable until done. The adapter switches into injection only after accepting the last idle beat, and advances its narrow slice only on handshake. It waits for both the complete input window and the complete output window, including when output arrives early. Single-beat callers retain the `INPUT_BITS` parameter and default `OUTPUT_PORT_BITS=OUTPUT_BITS`, `OUTPUT_BEATS=1`. New cores require an ordered, fixed number of output beats per input window for this policy; the development tests do not establish that property for an untested real core. See [recovery rules](../docs/deployment-recovery.md).
 
 ### Response cycle counter
 
@@ -86,85 +130,41 @@ These are checked or exhibited by the testbenches, not assumed. A core that viol
 | --- | --- | --- |
 | `ap_idle` exists on an `ap_vld` core | the adapter will not start a transaction until the core is idle | `validate_interface` refuses the core outright |
 | `ap_done` is deasserted whenever `ap_idle` is high | otherwise a sticky `ap_done` would be mistaken for the end of a request that was never started, returning a **stale result that passes the CRC and the numerical gate** | `host_avld_adapter_tb.v` section E runs a core with a deliberately sticky `ap_done` and asserts the request is refused |
-| one or more input beats per sample with exact lane division; exactly one output beat per sample | `host_stream_adapter.v` injects one complete input window and correlates its ordered output | `host_geometry` validates recorded counts/port widths; multi-output-beat cores remain unsupported |
-| the generated element grid equals the contract's `precision` | the wire scale would otherwise come from the core while the acceptance criterion's LSB term comes from the contract | `host_geometry` refuses the mismatch |
+| one or more input/output beats per sample with exact lane division | `host_stream_adapter.v` injects one complete input window and aggregates its ordered output window | `host_geometry` validates recorded counts/port widths; `host_stream_output_beats_tb.v` tests multiple output beats, stalls and early outputs; partial lanes remain unsupported |
+| generated input/output element grids match their hash-bound type sources | wire scaling must match actual emitted types; original-model tolerance has no LSB term | `host_geometry` validates header/defines/bridge hashes, grids and actual ports |
 
-All four hold for the cores measured so far. They are preconditions of the feed policy, not of the board.
+Historical measured cores and the new development tests provide different evidence. Multi-beat development coverage does not establish a new real core's behavior or board success. These properties describe the feed policy, not a new numerical acceptance criterion.
 
-**Operational consequence of the second row.** The transport's `QUARANTINE` state only leaves
-when `done` is asserted, so a frame that the adapter *refuses* (a sticky `ap_done`, or a core
-that never returns to `ap_idle`) wedges the transport there permanently: the host sees a
-timeout, and on hardware the board needs a reset before it will answer again. That is the
-price of refusing rather than inventing a `done` — inventing one would return a stale result
-that passes both gates.
+Historical transport observations include discarded frames and stuck cores. A timeout
+alone cannot distinguish them. Inspect existing raw traffic and actual state before choosing
+a minimal recovery; preserve every attempt. If the current configuration is genuinely invalid
+or stuck, an authorized reconfiguration can be the needed recovery. These observations do
+not require a universal reset/probe schedule, or a new download after valid numerical success.
+The exact board reset/clock wiring must still come from its verified profile, never inference.
 
-Measured on the AX7A200B (2026-09-29), the two failure modes must not be conflated:
+## Board execution and independent attempts
 
-| Observation | What it is | What it needs |
-| --- | --- | --- |
-| A frame the transport discards (e.g. a wrong length field) returns 0 bytes, and the next frame answers normally | a discarded frame, **not** a wedge — the transport's own RX-idle resynchronisation returns it to `SEEK_A5` | nothing |
-| A capture stops part-way with `partial response: 0/N bytes` and the board then answers **nothing**, however many correct frames are sent | a wedged path | a reset before any further capture |
-| A live capture misses an occasional single frame under a configuration that has already served thousands of frames | one lost transaction; the board is live immediately after | nothing, but the capture is still a failure: `verify_board.py` is fail-closed and never reuses a failed transaction into another sample's slot |
+Formal experiments are currently paused. These instructions do not authorize resuming them.
+When hardware execution is authorized, retain evidence tying the observed board, configured
+bitstream and complete request/output stream to the original model. Never use a previous
+model's unknown configuration as proof of the current model. Missing or genuinely invalid
+execution evidence requires inspecting existing data first and repeating only the smallest
+missing operation; keep every failed attempt. A liveness probe is optional diagnosis, not an
+extra CRC acceptance gate. Do not automatically reprogram an already numerically accepted
+model or repeat it for optional metrics. Historical observations of stale configurations are
+hazards to diagnose, not a universal configure/probe/recapture schedule.
 
-So "a timeout does not always mean a wedge" is true and must not be used to skip the reset.
-Because a wedge is only distinguishable from a discarded frame by whether the board answers
-*afterwards*, the always-safe rule is the one to apply before spending a capture.
+## Work in an isolated run
 
-**The only reset this toolchain can apply** to a purely volatile configuration is a full JTAG
-re-configuration: `program_jtag.py` on the bitstream already in the board directory re-downloads
-it and resets the whole fabric (`internal_rst_n` is driven by `MMCM.LOCKED` + `reset_sync`).
-There is no power or reset key reachable from the host, and no separate reset script. Measured:
-a board that answers nothing is answering every frame with a complete, CRC-valid response
-immediately after one re-configuration of the same bitstream.
-
-## Board session order — one capture per configuration, reset before each
-
-This is a required procedure, not a suggestion. It applies whenever a host bitstream is put on
-the board, and in particular when several models are brought up one after another in one
-session.
-
-For **each** model, in this order:
-
-1. **Configure.** `program_jtag.py` with that model's bitstream, its routed port audit and its
-   bitstream evidence. This configuration *is* the reset: never start a capture on a
-   configuration whose history is unknown, including "the one the previous model left behind".
-2. **Prove the path is live** on that same configuration, before spending the capture: send a
-   probe request and require a complete, CRC-valid, decodable response frame. A minimal probe
-   is one frame built with `protocol.encode_request` from the geometry
-   `host_geometry.geometry_for_wrapper` returns, decoded with `protocol.decode_response`. If
-   nothing comes back, re-configure and re-probe; do **not** proceed to the capture.
-3. **Capture once.** `verify_board.py` into that model's own capture directory.
-4. **On any failure, do not retry the capture.** Record the failure with its error, then
-   re-configure (step 1) before the next model. `verify_board.py` is fail-closed by design and
-   refusing to paper over a lost transaction with a retry is the point of it.
-
-Never let one model's capture run on the previous model's configuration without re-configuring
-in between. A capture that started on a stale configuration fails hours of work at sample 31
-with a symptom (`partial response: 0/N bytes`) that looks like a broken design and is not one.
-
-Measured cost of skipping this: a three-model session that configured back-to-back with no
-reset completed only the first model (100/100) and stopped the other two at 84/100 and 31/100;
-re-running the same three bitstreams with a re-configuration and a liveness probe before each
-capture completed all three at 100/100, with errors identical to the first pass to the last
-digit.
-
-## Work in one fresh run
-
-Bootstrap a new run with `scripts/line/bootstrap_run.py`; `--root` is the runs parent. Keep the contract copy, model, references and all new evidence in that run. Do not reuse the six delivered ROM bitstreams. Run `convert,csim,csynth,wrapper,boardsim` through `scripts/line/run_line.py` first. That ROM variant provides the existing numerical gate for the same core. The EDA lock rejects concurrent runs, so wait until the current run exits before starting the next.
-
-After the ROM board simulation passes, create a **separate** board directory under the same run:
-
-```powershell
-$py = 'D:\Agentic_FPGA_Deployment - 副本\.venv\Scripts\python.exe'
-$skill = 'C:\Users\Administrator\Agentic_FPGA_Deployment_skills\board-host-io\scripts'
-$run = '<fresh bootstrap run directory>'
-$deployment = '<that run\contract\model\deployment.yaml>'
-& $py "$skill\make_host_board.py" --source-wrapper "$run\p3-build\board\wrapper.json" --output "$run\p3-build\host-board"
-& $py "$skill\simulate_host.py" --deployment $deployment --board "$run\p3-build\host-board" --output "$run\evidence\host-sim"
-& $py "$skill\build_host.py" --deployment $deployment --board "$run\p3-build\host-board"
-```
-
-`simulate_host.py` elaborates the generated host top, inherited transport, the adapter the core's interface selects, and the real HLS core together. It sends every contract row as a framed request at the byte boundary, decodes every response frame and uses the contract's existing Python/HLS comparisons. It bypasses only the already board-verified UART bit timing so the full data set is tractable in simulation. `build_host.py` requires its `PASSED` evidence for the same contract, model and core, then invokes `vivado-manager/run_vivado.py` for synth, impl and bitstream in order under `%TEMP%\fpga_skill_line_eda.lock`. Each stage must report `PASSED`; routed resource fraction and timing gates remain those of the contract. The host board gets a new `board_top.bit`; the old ROM package and bitstream remain separate.
+Use a fresh output/attempt directory and current independent skill copy. Preserve the
+original model, inputs, complete CPU reference and actual core provenance. Build only the
+artifacts needed for the current change; a shell-only fix keeps a valid arithmetic core.
+`make_host_board.py` consumes the producer wrapper. `simulate_host.py` is optional development
+diagnosis using actual HLS RTL, byte-interface UART bypass and the original-model numerical
+rule. `build_host.py` records absent/failed/mismatched simulation as diagnosis and invokes
+synth/impl/bitstream serially under the EDA lock. Actual vendor failures stop downstream
+execution; resource fractions and timing summaries do not add numerical acceptance gates.
+No fixture, C++/RTL simulation, bitstream, port audit or JTAG exit code is board acceptance.
 
 ## Testbenches run without EDA
 
@@ -187,19 +187,19 @@ Read the **routed checkpoint**, not `wrapper.json` alone. The audit stores Vivad
 & $py "$skill\program_jtag.py" --bitstream "$run\p3-build\host-board\board_top.bit" --io-scope "$run\evidence\host-port-audit\io-scope.json" --bitstream-evidence "$run\evidence\host-vivado-bitstream-evidence.json" --output "$run\hardware-program" --cable-serial '<observed JTAG cable serial>'
 ```
 
-Programming is volatile JTAG only. The script checks the actual cable ID and declared target under that cable, then requires CRC error 0, EOS 1, DONE 1, IDCODE error 0 and bad-packet error 0. It refuses a bitstream whose hash, routed checkpoint or RTL differs from its own build evidence. It uses an independent non-queuing lock per JTAG cable, held by the OS during XSDB programming.
+Programming is volatile JTAG only. The script checks the actual cable ID and declared target under that cable, requires the logged configured-state observation after the actual download command. CRC/EOS/DONE/IDCODE/bad-packet fields are recorded diagnostics, and an unsupported optional config-status query is caught. A real download command failure is not suppressed. `programmed=true` describes that configuration observation only; `hardware_numerical_verified` remains false until complete live original-Python comparison. There is no default programming wall-clock limit. It refuses a bitstream whose hash, routed checkpoint or RTL differs from its own build evidence. It uses an independent non-queuing lock per JTAG cable, held by the OS during XSDB programming.
 An EDA build may run concurrently; a second programmer of the same cable is refused.
 The lock file remains in place; process exit releases the OS lock, so never delete the file to unlock it.
 
 ## Live numerical capture
 
-Use the port and USB bridge serial number observed on the connected host and validated against the recorded board profile. The capture uses all rows named by the run's contract; a pinned `verification.samples` count must match exactly. Every request and received chunk is flushed to `events.jsonl`, including partial frames on timeout. The client rejects stale bytes, partial responses, wrong or repeated sequence IDs, CRC errors, extra bytes and zero compute cycles. It never retries a failed transaction into another sample's slot.
+Use the port and USB bridge serial number observed on the connected host and validated against the recorded board profile. The capture uses all rows named by the run's contract; a pinned `verification.samples` count must match exactly. Every request and received chunk is flushed to `events.jsonl`, including partial frames on timeout. The client requires complete payloads paired to requests and rejects stale/unpaired bytes, partial responses and extra bytes. Numeric capture records magic/sequence/reported-length/CRC/cycle anomalies as diagnostics without changing or selecting payload values. Strict protocol helpers remain available for debugging. It never retries a failed transaction into another sample's slot.
 
 ```powershell
 & $py "$skill\verify_board.py" --deployment $deployment --board "$run\p3-build\host-board" --bitstream "$run\p3-build\host-board\board_top.bit" --io-scope "$run\evidence\host-port-audit\io-scope.json" --program-summary "$run\hardware-program\summary.json" --port '<observed COM port>' --serial-number '<observed CP2102 serial>' --output "$run\hardware-validation"
 ```
 
-The verifier compares every captured value to the run's Python output and HLS CSim output via `scripts/line/contract.py` and `scripts/line/evidence.py`; it never chooses a new tolerance. It writes `summary.json`, `python-evidence.json`, `hls-evidence.json`, `fpga-output.json`, `events.jsonl`, `provenance.json` and a file manifest. Only a complete live capture with both gates passed may set `hardware_numerical_verified=true`. A generated wrapper, passing simulation, bitstream, port audit or JTAG configuration alone never does.
+The verifier compares every captured value to original-model Python under `.001+.001*abs(ref)`; HLS CSim is optional diagnostic context. It writes `summary.json`, `python-evidence.json`, `hls-evidence.json`, `fpga-output.json`, `events.jsonl`, `provenance.json` and a file manifest. Only a complete live capture passing original-model Python comparison with execution provenance may set `hardware_numerical_verified=true`. A generated wrapper, passing simulation, bitstream, port audit or JTAG configuration alone never does.
 
 The existing `bitstream-package` command packages the ROM variant only. Its `ports` stage audits the ROM routed checkpoint and includes `io-scope.json` with `configure-only` in the package. It does not package this host variant. Keep the host-board artifacts and on-board evidence in the run until a dedicated host package gate is available; do not relabel an old package as hardware verified.
 

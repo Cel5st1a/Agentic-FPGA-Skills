@@ -11,6 +11,37 @@ allowed-tools: Bash, Read, Write, Edit, Grep
 
 # hls4ml Converter
 
+S15-opt 规则优先读 [ORDER.md](../ORDER.md)。本版 auto 保留完整原网络，拒绝 logits-only 裁剪。
+配置审计和实际 RF 替换如实记录为诊断，不删除生成工程。转换证据含逐层参数网格观察；
+先定位小权重、范围或累加问题，再局部调整，不固定统一位宽。可选的
+`softmax_exp_read_factor` 只修改已识别模板的表读取调度，不修改指数或归一化。
+
+### 局部参数精度试验（显式工具，非默认转换）
+
+`scripts/local_precision_search.py` 复用原模型加载与配置，只在新输出目录内试验。
+支持普通 Keras 文件/JSON权重模型，以及保留原量化器的QKeras JSON权重模型；
+接口仍限`io_parallel`、单输入/输出。普通模型单层角色包括
+`weight`、`bias`、`result`、`accum`、`table`、`exp_table`、`inv_table`、`inv_inp`。
+后端实际节点未声明的角色会拒绝，不把注入但未使用的类型属性当已生效。
+先用现有类型编译生成的 C++，与完整原 CPU 输出比较；基线已通过便停止。
+否则按调用方给定顺序逐个只改目标参数角色，选第一个在已提供输入上满足
+`.001+.001*abs(ref)` 的候选，不声称最小资源或全输入域最优。示例工具参数：
+`--deployment <yaml> --output <new-dir> --layer <actual-layer> --role weight
+--candidates "ap_fixed<24,6>" --compiler <host-g++>`。
+
+全部尝试保留原配置、有效配置、实际参数类型、源码哈希、编译命令和原始日志、
+输出与比较；编译失败的数值结果为未知，不用Python定点近似替代。原模型、输入和
+契约哈希变化时结论失效。主机 C++ 通过不等于 RTL 或板端通过，不修改正式实验条件。
+`--trace-layers` 对比可对应的原Keras边界与实际C++层输出，标记最早观察偏差；
+融合激活等无法对应处保持未知，不推断唯一根因或内部累加轨迹。多输入/输出、
+自动最优类型求解不在支持范围，不声称整网自动最优。
+QKeras读取原QActivation和kernel/bias量化器，只试内部accum/表角色；
+weight、bias、result角色会拒绝，防止改变训练量化语义。关联权重也纳入原文件哈希检查。
+同一生成C++沿用版本绑定的po2兼容修复和输出接口网格；未知模板不自动改写。
+`--trace-layers`包含可对应的QActivation边界；数值失败如实保留，定位不是自动修复。
+合成量化Dense/Conv2D回归验证了原量化层零差和Softmax失败定位，尚无opt3板测。
+具体调用及限制见 [opt3工具说明](../docs/opt3-tools.md)。
+
 ## Purpose
 Reliable model-to-HLS conversion with automatic configuration, backend
 selection, and HLS code generation. Primary path: Keras/TF model → hls4ml.
@@ -77,7 +108,7 @@ missing script, so this gap fails loudly instead of half-way through a run.
 
 转换器同时合并契约 `hls_config` 的 `Model/LayerName/LayerType`；null 视为未设置，冲突的全局/逐层 RF、全局精度、Strategy 或 softmax skip 必须失败。`configuration_audit` 记录请求、传给 hls4ml 的配置、生成参数与类型及其哈希。对 hls4ml 1.3.0，`TableType` 保留并告警，真正决定 table typedef 的键是 `Table_t`；不得静默替换冻结字段。
 
-QKeras 保留内部量化，只固定解析后的最终 HLS 图输出到契约网格。使用 exponential product 的新工程自动执行已验证的 hls4ml 1.3.0 po2 乘积位宽修复；补丁只写工程副本，版本/模板哈希未知即拒绝。证据包含 `output_grid_pin` 与 `compatibility_repairs`。转换完成仍须完整 CSim 数值门。
+QKeras 保留内部量化，只固定解析后的最终 HLS 图输出到契约网格。使用 exponential product 的新工程自动执行已验证的 hls4ml 1.3.0 po2 乘积位宽修复；补丁只写工程副本，版本/模板哈希未知即拒绝。证据包含 `output_grid_pin` 与 `compatibility_repairs`。可选C++诊断须比较完整原输出；不把CSim作为额外板端验收门槛。
 
 失败诊断与恢复步骤见 [转换与上板恢复规则](../docs/deployment-recovery.md)。
 
@@ -157,3 +188,19 @@ hls_project/
 - Conversion is read-only on input model
 - Output written to separate directory
 - Delete output directory to rollback
+
+## opt2-wide host diagnostic efficiency
+
+Read [model-family efficiency](../docs/efficiency-by-model-family.md) before selecting a
+frontend/tool. The local ordinary-Keras helper now obtains all eligible stateless layer
+references with one multi-output observer, preserving mapped boundaries and numeric values.
+Stateful graphs retain legacy per-layer behavior; this does not authorize new graph support.
+The helper still refuses quantized QKeras, ONNX and unsupported I/O modes: use the original
+frontend and its CPU reference path, never remove quantizers/branches to fit a helper.
+For missing private/group references, inspect or regenerate CPU references from this group's
+original model and exact inputs; missing reference files alone do not require rerunning EDA.
+Do not treat this convenience as replacing real board numerical acceptance.
+
+## Opt4 streaming pooling compatibility
+Keras conversion with hls4ml 1.3.0 and the Vitis backend installs a hash-checked generated-project repair. Supported 2x2 stride-2 unpadded MaxPooling2D with one complete channel vector per stream packet uses explicit indexed row storage. Other geometries retain the stock function. The conversion evidence records the repair. No model or weight files are patched.
+If CSim passes while RTL differs, compare tensors across the earliest pooling boundary before broad precision/RF searches. Reuse existing captures. Confirm the first differing layer and preserve failed attempts.

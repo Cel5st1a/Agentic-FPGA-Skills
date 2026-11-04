@@ -20,10 +20,8 @@ import shutil
 import sys
 from pathlib import Path
 
-from geometry_fixtures import synthetic_geometry, wrapper_record
-
 import pytest
-
+from geometry_fixtures import synthetic_geometry
 
 SKILL = Path(__file__).resolve().parents[1]
 RUN = Path(r"D:\ML_models\_line\runs\mlp_64_32\20260928-hostd")
@@ -53,20 +51,36 @@ def board_profile(**overrides) -> dict:
         "board_id": "AX7A200B",
         "fpga": {"part": "xc7a200tfbg484-2"},
         "board_pins": {
-            "clock": {"kind": "differential", "clk_p": "R4", "clk_n": "T4",
-                      "frequency_mhz": 200, "core_frequency_mhz": 100,
-                      "iostandard": "DIFF_SSTL15",
-                      "provenance": "test fixture: AX7A200B manual + vendor uart_test.xdc"},
-            "reset": {"pin": "F15", "iostandard": "LVCMOS33",
-                      "provenance": "test fixture: AX7A200B manual"},
+            "clock": {
+                "kind": "differential",
+                "clk_p": "R4",
+                "clk_n": "T4",
+                "frequency_mhz": 200,
+                "core_frequency_mhz": 100,
+                "iostandard": "DIFF_SSTL15",
+                "provenance": "test fixture: AX7A200B manual + vendor uart_test.xdc",
+            },
+            "reset": {
+                "pin": "F15",
+                "iostandard": "LVCMOS33",
+                "provenance": "test fixture: AX7A200B manual",
+            },
         },
-        "peripherals": {"uart": {"fpga_rxd": "L14", "fpga_txd": "L15",
-                                 "iostandard": "LVCMOS33",
-                                 "host_bridge": {"chip": "CP2102GM", "usb_vid": "10c4",
-                                                 "usb_pid": "ea60",
-                                                 "serial_number": "TESTSERIAL",
-                                                 "provenance": "test fixture"},
-                                 "provenance": "test fixture: cnn-board-03 verified pinout"}},
+        "peripherals": {
+            "uart": {
+                "fpga_rxd": "L14",
+                "fpga_txd": "L15",
+                "iostandard": "LVCMOS33",
+                "host_bridge": {
+                    "chip": "CP2102GM",
+                    "usb_vid": "10c4",
+                    "usb_pid": "ea60",
+                    "serial_number": "TESTSERIAL",
+                    "provenance": "test fixture",
+                },
+                "provenance": "test fixture: cnn-board-03 verified pinout",
+            }
+        },
     }
     for key, value in overrides.items():
         target = profile
@@ -91,8 +105,8 @@ def run_tree(tmp_path: Path):
     real = json.loads((RUN / "p3-build" / "board" / "wrapper.json").read_text(encoding="utf-8"))
     model = contract_dir / "encoder.keras"
     (run / "starting-state.json").write_text(
-        json.dumps({"model_files": {"encoder.keras": {"sha256": sha256(model)}}}),
-        encoding="utf-8")
+        json.dumps({"model_files": {"encoder.keras": {"sha256": sha256(model)}}}), encoding="utf-8"
+    )
 
     profile_path = tmp_path / "board_profile.yaml"
     profile_path.write_text(json.dumps(board_profile()), encoding="utf-8")
@@ -116,8 +130,13 @@ def run_tree(tmp_path: Path):
             "clock_pair": real["board"]["clock_pair"],
         },
     }
-    return {"run": run, "deployment": deployment, "record": record,
-            "profile_path": profile_path, "tmp": tmp_path}
+    return {
+        "run": run,
+        "deployment": deployment,
+        "record": record,
+        "profile_path": profile_path,
+        "tmp": tmp_path,
+    }
 
 
 def generate(run_tree, out_name="board", generator=None):
@@ -129,6 +148,7 @@ def generate(run_tree, out_name="board", generator=None):
 
 
 # ---------------------------------------------------------------- positive control
+
 
 def test_the_fixture_itself_generates_a_board(run_tree):
     """Without this, every refusal below could be passing for an unrelated reason."""
@@ -144,6 +164,7 @@ def test_the_fixture_itself_generates_a_board(run_tree):
 
 # ---------------------------------------------------------------- the ten gates
 
+
 def test_gate_output_directory_must_be_empty(run_tree):
     generate(run_tree)
     with pytest.raises(ValueError, match="not empty"):
@@ -158,7 +179,8 @@ def test_gate_core_verilog_hash_must_match_the_record(run_tree):
 
 def test_gate_model_must_match_the_bootstrap_starting_state(run_tree):
     (run_tree["run"] / "starting-state.json").write_text(
-        json.dumps({"model_files": {"encoder.keras": {"sha256": "0" * 64}}}), encoding="utf-8")
+        json.dumps({"model_files": {"encoder.keras": {"sha256": "0" * 64}}}), encoding="utf-8"
+    )
     with pytest.raises(ValueError, match="starting-state hash"):
         generate(run_tree)
 
@@ -181,12 +203,25 @@ def test_uart_pins_follow_the_board_profile(run_tree):
     matters is that the generated artifact follows it.
     """
     run_tree["profile_path"].write_text(
-        json.dumps(board_profile(peripherals__uart={
-            "fpga_rxd": "V18", "fpga_txd": "AA19", "iostandard": "LVCMOS33",
-            "host_bridge": {"chip": "FT232R", "usb_vid": "0403", "usb_pid": "6001",
-                            "serial_number": "AV0KR4KQ", "provenance": "test fixture"},
-            "provenance": "test fixture: Digilent Nexys Video master XDC"})),
-        encoding="utf-8")
+        json.dumps(
+            board_profile(
+                peripherals__uart={
+                    "fpga_rxd": "V18",
+                    "fpga_txd": "AA19",
+                    "iostandard": "LVCMOS33",
+                    "host_bridge": {
+                        "chip": "FT232R",
+                        "usb_vid": "0403",
+                        "usb_pid": "6001",
+                        "serial_number": "AV0KR4KQ",
+                        "provenance": "test fixture",
+                    },
+                    "provenance": "test fixture: Digilent Nexys Video master XDC",
+                }
+            )
+        ),
+        encoding="utf-8",
+    )
     generate(run_tree)
     xdc = (run_tree["tmp"] / "board" / "board.xdc").read_text(encoding="utf-8")
     assert "set_property PACKAGE_PIN V18 [get_ports uart_rx]" in xdc
@@ -227,25 +262,40 @@ def test_single_ended_profile_generates_ibuf_and_one_clock_port(run_tree):
     profile["board_id"] = "NexysVideo"
     profile["fpga"] = {"part": "xc7a200tsbg484-1"}
     profile["board_pins"]["clock"] = {
-        "kind": "single_ended", "pin": "R4", "frequency_mhz": 100,
-        "core_frequency_mhz": 100, "iostandard": "LVCMOS33",
-        "provenance": "test fixture: Digilent Nexys Video master XDC"}
+        "kind": "single_ended",
+        "pin": "R4",
+        "frequency_mhz": 100,
+        "core_frequency_mhz": 100,
+        "iostandard": "LVCMOS33",
+        "provenance": "test fixture: Digilent Nexys Video master XDC",
+    }
     profile["board_pins"]["reset"] = {
-        "pin": "G4", "iostandard": "LVCMOS15",
-        "provenance": "test fixture: Digilent master XDC, cpu_resetn"}
+        "pin": "G4",
+        "iostandard": "LVCMOS15",
+        "provenance": "test fixture: Digilent master XDC, cpu_resetn",
+    }
     profile["peripherals"]["uart"] = {
-        "fpga_rxd": "V18", "fpga_txd": "AA19", "iostandard": "LVCMOS33",
-        "host_bridge": {"chip": "FT232R", "usb_vid": "0403", "usb_pid": "6001",
-                        "serial_number": "AV0KR4KQ", "provenance": "test fixture"},
-        "provenance": "test fixture: Digilent master XDC, uart_tx_in/uart_rx_out"}
+        "fpga_rxd": "V18",
+        "fpga_txd": "AA19",
+        "iostandard": "LVCMOS33",
+        "host_bridge": {
+            "chip": "FT232R",
+            "usb_vid": "0403",
+            "usb_pid": "6001",
+            "serial_number": "AV0KR4KQ",
+            "provenance": "test fixture",
+        },
+        "provenance": "test fixture: Digilent master XDC, uart_tx_in/uart_rx_out",
+    }
     run_tree["profile_path"].write_text(json.dumps(profile), encoding="utf-8")
     run_tree["record"]["part"] = "xc7a200tsbg484-1"
     run_tree["record"]["board"]["part"] = "xc7a200tsbg484-1"
     run_tree["record"]["board"]["pins"] = {"clk_p": "R4", "clk_n": None, "clk_mhz": 100}
     run_tree["record"]["board"]["clock_pair"]["iostandard"] = "LVCMOS33"
     run_tree["record"]["board"]["reset"] = {"pin": "G4", "iostandard": "LVCMOS15"}
-    run_tree["record"]["clock"] = dict(run_tree["record"]["clock"], reference_mhz=100.0,
-                                       mmcm_mult=10.0, mmcm_divide=10.0)
+    run_tree["record"]["clock"] = dict(
+        run_tree["record"]["clock"], reference_mhz=100.0, mmcm_mult=10.0, mmcm_divide=10.0
+    )
     record = generate(run_tree)
     top = (run_tree["tmp"] / "board" / "board_top.v").read_text(encoding="utf-8")
     xdc = (run_tree["tmp"] / "board" / "board.xdc").read_text(encoding="utf-8")
@@ -267,8 +317,9 @@ def test_gate_uart_bridge_is_a_board_fact(run_tree):
     run_tree["profile_path"].write_text(json.dumps(board_profile()), encoding="utf-8")
     generate(run_tree)
     module = load("board_facts")
-    facts = module.load_facts(json.loads(run_tree["profile_path"].read_text()),
-                              run_tree["profile_path"])
+    facts = module.load_facts(
+        json.loads(run_tree["profile_path"].read_text()), run_tree["profile_path"]
+    )
 
     class Device:
         device = "COM9"
@@ -319,19 +370,27 @@ def test_gate_part_must_match_the_board_profile(run_tree):
         generate(run_tree)
 
 
-def test_gate_response_length_must_fit_one_byte():
+def test_gate_response_length_must_fit_two_bytes():
     """host_geometry's own fail-closed bound, which no other test exercised."""
     module = load("host_geometry")
-    with pytest.raises(ValueError, match="one byte|255"):
-        synthetic_geometry(module, 
-            {"precision": "ap_fixed<32,12>", "model": {"input_shape": [4, 1000]}},
-            references=[[0.0] * 1000])
+    with pytest.raises(ValueError, match="65535"):
+        synthetic_geometry(
+            module,
+            {
+                "precision": "ap_fixed<32,12>",
+                "model": {"input_shape": [4, 1000]},
+                "host_transport": {"framing": "single"},
+            },
+            references=[[0.0] * 16383],
+        )
 
 
 def test_gate_reference_rows_must_be_rows_not_scalars():
     """A flat list of numbers is not a reference table; refuse rather than read it as N rows."""
     module = load("host_geometry")
     with pytest.raises(ValueError, match="row"):
-        synthetic_geometry(module, 
+        synthetic_geometry(
+            module,
             {"precision": "ap_fixed<32,12>", "model": {"input_shape": [4, 64]}},
-            references=[0.0, 0.0, 0.0, 0.0])
+            references=[0.0, 0.0, 0.0, 0.0],
+        )

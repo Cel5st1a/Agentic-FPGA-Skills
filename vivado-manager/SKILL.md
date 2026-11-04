@@ -10,7 +10,20 @@ allowed-tools: Bash, Read, Write, Edit, Grep, Glob
 
 # Vivado Manager
 
-部署恢复与完成证据核验按 [转换与上板恢复规则](../docs/deployment-recovery.md) 执行。综合、实现/布线、bitstream 分别记录实际子进程与耗时，复合构建起点不能代替当前子阶段起点。流包装采用按元素排序的窄同步读 ROM；数组包装保持每样本一个宽字。面积或拥堵问题先核对层级报告与包装逻辑，不只看 HLS 估计；WNS/WHS 门禁保持冻结，负 WNS 不可接受。
+本版优先遵守 [ORDER.md 的用户数值标准](../ORDER.md)。综合、实现/布线、bitstream 分别记录真实执行与耗时，复合构建起点不能代替当前阶段起点。资源比例和 WNS/WHS 保留为诊断，不凭报告目标拒收数值已通过的结果；真实容量超限、不可布线、厂商错误及电气安全要求不忽略。bitstream 或退出码不证明硬件成功。使用新的尝试目录保留每次原始输出，不静默覆盖。
+
+## opt2 efficiency handoff
+
+Before repeating implementation, read [timing-closure-debugger](../timing-closure-debugger/SKILL.md).
+Use existing synthesis reports and emitted kernel/config to distinguish arithmetic mapping,
+shell mux/fanout and physical strategy. Preserve a valid same-identity synthesis checkpoint
+when only physical directives change; preserve the arithmetic core for shell-only fixes.
+No automatic cache skip: identity plus valid evidence and dependency coverage are required.
+Do not reset and rerun synthesis merely to regenerate reports or restart an equivalent
+candidate. A long active route has no default wall cutoff. Use owned PID+birth safe-stop
+only when authorized, never kill by name. No implementation optimization can replace the
+complete original-model board numerical check, and no optional report warrants a rerun
+after that check passes. Current hardware permission comes from the user/campaign ledger.
 
 ## Purpose
 Automate Vivado IDE operations via Tcl scripting. Create projects, add source
@@ -53,7 +66,7 @@ When targeting AX7A200B, the following are automatically applied:
 python scripts/run_vivado.py --stage {synth|impl|bitstream} \
     --board <run>/p3-build/board \
     --deployment <run>/contract/<pkg>/deployment.yaml \
-    --work <run>/p3-build/board \
+    --work <run>/p3-build/vivado-logs/<stage>-<attempt> \
     --evidence <run>/evidence/vivado-<stage>-evidence.json
 
 # Board-level RTL simulation and the wrapper generator are separate scripts in this skill

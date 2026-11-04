@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 RULE_FOUR_LSB = "four_effective_output_lsbs"
 RULE_RANGE = "range_relative"
+RULE_ORIGINAL = "original_model_abs_rel"
 RULES = (RULE_FOUR_LSB, RULE_RANGE)
 
 #: Absolute floor of the frozen rule, in output units. The operator's rule uses
@@ -128,9 +129,7 @@ def criterion_from_deployment(contract: dict) -> Criterion:
         rule_source="contract.verification.rule" if declared_rule else "code_default",
         atol_source=atol_source,
         samples_source=(
-            "contract.verification.samples"
-            if declared_samples is not None
-            else "code_default"
+            "contract.verification.samples" if declared_samples is not None else "code_default"
         ),
     )
 
@@ -144,6 +143,8 @@ def _as_rows(values) -> list[list[float]]:
 def tolerance_for(criterion: Criterion, reference) -> list[list[float]]:
     """Per-value tolerance for the given reference, in the reference's own shape."""
     rows = _as_rows(reference) or [[0.0]]
+    if criterion.rule == RULE_ORIGINAL:
+        return [[criterion.atol + criterion.rtol * abs(value) for value in row] for row in rows]
     if criterion.rule == RULE_FOUR_LSB:
         base = max(criterion.floor, criterion.atol)
         return [[base + criterion.rtol * abs(value) for value in row] for row in rows]
@@ -153,3 +154,20 @@ def tolerance_for(criterion: Criterion, reference) -> list[list[float]]:
         rms = math.sqrt(sum(value * value for value in row) / len(row)) if row else 0.0
         tolerances.append([max(criterion.rho * max(spread, rms), criterion.atol)] * len(row))
     return tolerances
+
+
+def original_model_criterion(contract: dict | None = None) -> Criterion:
+    """Human-specified criterion for this S15 optimization campaign, not an LSB rule."""
+    samples = (contract or {}).get("verification", {}).get("samples", 256)
+    if type(samples) is not int or samples <= 0:
+        raise ValueError("verification.samples must be a positive integer")
+    return Criterion(
+        rule=RULE_ORIGINAL,
+        atol=0.001,
+        rtol=0.001,
+        samples=samples,
+        source="human_acceptance_20261021",
+        rule_source="human_acceptance_20261021",
+        atol_source="human_acceptance_20261021",
+        samples_source=("contract.verification.samples" if "samples" in (contract or {}).get("verification", {}) else "human_acceptance_20261021"),
+    )

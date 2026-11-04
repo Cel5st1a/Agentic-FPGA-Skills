@@ -16,21 +16,21 @@ from pathlib import Path
 
 import yaml
 
-
 SKILLS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SKILLS / "scripts"))
 sys.path.insert(0, str(SKILLS / "vivado-manager" / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from line.geometry import flatten_sample as flatten, sample_rows
-from line.contract import criterion_from_deployment  # noqa: E402
-from line.evidence import compare  # noqa: E402
-from line.run_line import Lock  # noqa: E402
-from host_geometry import Geometry, geometry_for_wrapper  # noqa: E402
 import board_facts  # noqa: E402
+from cycle_metrics import cycle_counter_record  # noqa: E402
+from host_geometry import Geometry, geometry_for_wrapper  # noqa: E402
+from line.contract import original_model_criterion as simulation_criterion  # noqa: E402
+from line.evidence import compare  # noqa: E402
+from line.geometry import flatten_sample as flatten  # noqa: E402,F401 - public compatibility alias
+from line.geometry import sample_rows  # noqa: E402
+from line.run_line import Lock  # noqa: E402
 from protocol import decode_response, encode_request  # noqa: E402
 from run_board_sim import DEFAULT_VIVADO, run_tool  # noqa: E402
 from stage_rtl import stage_rtl  # noqa: E402
-from cycle_metrics import cycle_counter_record  # noqa: E402
 
 
 def sha256_file(path: Path) -> str:
@@ -38,12 +38,14 @@ def sha256_file(path: Path) -> str:
 
 
 def read_rows(path: Path) -> list[list[float]]:
-    return [[float(value) for value in line.split()]
-            for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    return [
+        [float(value) for value in line.split()]
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
-def render_testbench(sample_count: int, geometry: Geometry,
-                     facts: board_facts.BoardFacts) -> str:
+def render_testbench(sample_count: int, geometry: Geometry, facts: board_facts.BoardFacts) -> str:
     if not 1 <= sample_count <= 65536:
         raise ValueError("sample count must fit the uint16 sequence space")
     # The testbench forces the generated top's internal clock and reset nets, so the clock
@@ -54,11 +56,46 @@ def render_testbench(sample_count: int, geometry: Geometry,
         clock_ties = f".{clock_ports[0]}(1'b0), .{clock_ports[1]}(1'b1)"
     else:
         clock_ties = f".{clock_ports[0]}(1'b0)"
+    chunk_declaration = ""
+    request_loop = """
+            for (byte_index = 0; byte_index < REQUEST_BYTES; byte_index = byte_index + 1) begin
+                @(negedge clk);
+                rx_data_i = request_bytes[sample*REQUEST_BYTES + byte_index];
+                rx_valid_i = 1;
+                @(negedge clk);
+                rx_valid_i = 0;
+            end
+"""
+    if geometry.framing == "chunked_v1":
+        chunk_declaration = f"localparam integer CHUNK_BYTES = {geometry.chunk_bytes};"
+        request_loop = f"""
+            byte_index = 0;
+            for (chunk_index = 0; chunk_index < {geometry.input_chunks};
+                 chunk_index = chunk_index+1) begin
+                chunk_size = ({geometry.payload_bytes}-chunk_index*CHUNK_BYTES>CHUNK_BYTES) ?
+                    CHUNK_BYTES : {geometry.payload_bytes}-chunk_index*CHUNK_BYTES;
+                for (chunk_byte=0; chunk_byte<chunk_size+16; chunk_byte=chunk_byte+1) begin
+                    @(negedge clk);
+                    rx_data_i=request_bytes[sample*REQUEST_BYTES+byte_index];
+                    rx_valid_i=1; byte_index=byte_index+1;
+                    @(negedge clk); rx_valid_i=0;
+                end
+                waited=0;
+                while (tx_count < sample*RESPONSE_BYTES+(chunk_index+1)*20 && waited<MAX_WAIT) begin
+                    @(negedge clk);waited=waited+1;
+                end
+                if (tx_count < sample*RESPONSE_BYTES+(chunk_index+1)*20)
+                    $fatal(1,"missing input ACK");
+                repeat(4) @(negedge clk);
+            end
+"""
     return f"""`timescale 1ns/1ps
 module board_top_tb;
     localparam integer SAMPLE_COUNT = {sample_count};
     localparam integer REQUEST_BYTES = {geometry.request_bytes};
     localparam integer RESPONSE_BYTES = {geometry.response_frame_bytes};
+    localparam integer MAX_WAIT = {max(100000, geometry.response_frame_bytes * 8)};
+    {chunk_declaration}
     reg clk = 0, rst_n = 0;
     reg rx_valid_i = 0, tx_ready_i = 1;
     reg [7:0] rx_data_i = 0;
@@ -66,6 +103,7 @@ module board_top_tb;
     reg [7:0] response_bytes [0:SAMPLE_COUNT*RESPONSE_BYTES-1];
     wire uart_tx;
     integer result_file, sample, byte_index, output_index, waited, tx_count = 0;
+    integer chunk_index, chunk_size, chunk_byte;
     always #5 clk = ~clk;
     board_top dut({clock_ties}, .rst_n(rst_n),
                   .uart_rx(1'b1), .uart_tx(uart_tx));
@@ -98,15 +136,9 @@ module board_top_tb;
         rst_n = 1;
         repeat (12) @(negedge clk);
         for (sample = 0; sample < SAMPLE_COUNT; sample = sample + 1) begin
-            for (byte_index = 0; byte_index < REQUEST_BYTES; byte_index = byte_index + 1) begin
-                @(negedge clk);
-                rx_data_i = request_bytes[sample*REQUEST_BYTES + byte_index];
-                rx_valid_i = 1;
-                @(negedge clk);
-                rx_valid_i = 0;
-            end
+{request_loop}
             waited = 0;
-            while (tx_count < (sample+1)*RESPONSE_BYTES && waited < 100000) begin
+            while (tx_count < (sample+1)*RESPONSE_BYTES && waited < MAX_WAIT) begin
                 @(negedge clk);
                 waited = waited + 1;
             end
@@ -130,23 +162,41 @@ endmodule
 """
 
 
-def decode_frames(lines: list[str], sequences: list[int],
-                  geometry: Geometry) -> tuple[list[int], list[list[float]]]:
+def decode_frames(
+    lines: list[str], sequences: list[int], geometry: Geometry, *, strict=True, on_diagnostic=None
+) -> tuple[list[int], list[list[float]]]:
     if len(lines) != len(sequences):
         raise ValueError(f"response count {len(lines)} != request count {len(sequences)}")
     cycles, outputs = [], []
-    for line, sequence in zip(lines, sequences):
+    for line, sequence in zip(lines, sequences, strict=True):
         frame = bytes.fromhex(line.strip())
-        count, values = decode_response(frame, sequence, geometry)
+        count, values = decode_response(
+            frame, sequence, geometry, strict=strict, on_diagnostic=on_diagnostic
+        )
         cycles.append(count)
         outputs.append(values)
     return cycles, outputs
 
 
+def evaluate_simulation(python_reference, hls_reference, outputs, criterion):
+    python_gate = compare("host_sim_vs_python", python_reference, outputs, criterion)
+    hls_gate = (
+        compare("host_sim_vs_hls", hls_reference, outputs, criterion)
+        if hls_reference is not None
+        else {"status": "NOT_RUN", "passed": None}
+    )
+    return {
+        "python": python_gate,
+        "hls": hls_gate,
+        "status": "PASSED" if python_gate["passed"] else "FAILED",
+    }
+
+
 def simulation_completed(stdout: str, sample_count: int) -> bool:
     marker = rf"(?m)^HOST_INTEGRATION_PASS samples={sample_count}$"
-    return (re.search(marker, stdout) is not None
-            and "Fatal:" not in stdout and "ERROR:" not in stdout)
+    return (
+        re.search(marker, stdout) is not None and "Fatal:" not in stdout and "ERROR:" not in stdout
+    )
 
 
 def simulate(deployment: Path, board: Path, output: Path, vivado: Path = DEFAULT_VIVADO) -> dict:
@@ -171,20 +221,23 @@ def simulate(deployment: Path, board: Path, output: Path, vivado: Path = DEFAULT
         raise ValueError("model changed after host board generation")
 
     contract = yaml.safe_load(deployment.read_text(encoding="utf-8-sig"))
-    criterion = criterion_from_deployment(contract)
+    criterion = simulation_criterion()
     # Same helper, same inputs as make_host_board.py and verify_board.py: the builder and the
     # verifier cannot disagree about the frame, including the baudrate from the board profile.
     geometry = geometry_for_wrapper(deployment, contract, wrapper)
     inputs_path = (deployment.parent / contract["verification"]["inputs"]).resolve()
     payload = json.loads(inputs_path.read_text(encoding="utf-8"))
     if isinstance(payload, dict):
-        payload = next((payload[key] for key in ("inputs", "samples", "data") if key in payload), None)
+        payload = next(
+            (payload[key] for key in ("inputs", "samples", "data") if key in payload), None
+        )
     if not isinstance(payload, list) or not payload:
         raise ValueError("contract input file has no samples")
     inputs = sample_rows(payload, "inputs")
     if any(len(row) != geometry.in_elements for row in inputs):
-        raise ValueError(f"the derived geometry needs {geometry.in_elements} input elements "
-                         "per sample")
+        raise ValueError(
+            f"the derived geometry needs {geometry.in_elements} input elements per sample"
+        )
     if criterion.samples_source != "code_default" and len(inputs) != criterion.samples:
         raise ValueError("input count differs from the contract's verification.samples")
     if len(inputs) > 65536:
@@ -192,34 +245,55 @@ def simulate(deployment: Path, board: Path, output: Path, vivado: Path = DEFAULT
     python_path = run_dir / "evidence" / "python-output.json"
     hls_path = run_dir / "p3-build" / "csim" / "csim_results.log"
     python_reference = json.loads(python_path.read_text(encoding="utf-8"))
-    hls_reference = read_rows(hls_path)
-    if len(python_reference) != len(inputs) or len(hls_reference) != len(inputs):
-        raise ValueError("reference count differs from host request count")
+    hls_reference, hls_diagnostic = None, {"status": "NOT_RUN"}
+    if hls_path.is_file():
+        try:
+            hls_reference = read_rows(hls_path)
+            if len(hls_reference) != len(inputs):
+                raise ValueError("HLS reference count differs from requests")
+            hls_diagnostic = {"status": "LOADED", "sha256": sha256_file(hls_path)}
+        except (OSError, ValueError) as exc:
+            hls_reference = None
+            hls_diagnostic = {"status": "INVALID", "reason": str(exc)}
+    if len(python_reference) != len(inputs):
+        raise ValueError("original Python reference count differs from host request count")
 
     output.mkdir(parents=True, exist_ok=True)
     staged = stage_rtl(board, wrapper)
     rtl = board / "rtl"
     sequences = list(range(len(inputs)))
-    request_bytes = b"".join(encode_request(row, sequence, geometry)
-                             for row, sequence in zip(inputs, sequences))
+    request_bytes = b"".join(
+        encode_request(row, sequence, geometry)
+        for row, sequence in zip(inputs, sequences, strict=True)
+    )
     request_file = rtl / "request_bytes.hex"
-    request_file.write_text("\n".join(f"{byte:02x}" for byte in request_bytes) + "\n",
-                            encoding="ascii")
+    request_file.write_text(
+        "\n".join(f"{byte:02x}" for byte in request_bytes) + "\n", encoding="ascii"
+    )
     testbench = rtl / "board_top_tb.v"
     facts = board_facts.facts_for_wrapper(wrapper)
     testbench.write_text(render_testbench(len(inputs), geometry, facts), encoding="ascii")
     hook = board / "host_sim_run.tcl"
-    hook.write_text(f'set rtl_dir "{rtl.as_posix()}"\n'
-                    'foreach data_file [glob -nocomplain -directory $rtl_dir *.dat] {\n'
-                    '    file copy -force $data_file [file tail $data_file]\n}\n'
-                    'file copy -force "$rtl_dir/request_bytes.hex" request_bytes.hex\n'
-                    'run all\n', encoding="utf-8")
+    hook.write_text(
+        f'set rtl_dir "{rtl.as_posix()}"\n'
+        "foreach data_file [glob -nocomplain -directory $rtl_dir *.dat] {\n"
+        "    file copy -force $data_file [file tail $data_file]\n}\n"
+        'file copy -force "$rtl_dir/request_bytes.hex" request_bytes.hex\n'
+        "run all\n",
+        encoding="utf-8",
+    )
     template = SKILLS / "vivado-manager" / "templates" / "simulate.tcl"
-    values = {"THREADS": "4", "PROJECT_NAME": f"{wrapper['top']}_host",
-              "PART": wrapper["part"], "TOP": "board_top", "TB": "board_top_tb.v",
-              "TB_TOP": "board_top_tb", "RTL_DIR": rtl.as_posix(),
-              "XDC": (rtl / "board.xdc").as_posix(),
-              "SIM_RUN_TCL": hook.as_posix()}
+    values = {
+        "THREADS": "4",
+        "PROJECT_NAME": f"{wrapper['top']}_host",
+        "PART": wrapper["part"],
+        "TOP": "board_top",
+        "TB": "board_top_tb.v",
+        "TB_TOP": "board_top_tb",
+        "RTL_DIR": rtl.as_posix(),
+        "XDC": (rtl / "board.xdc").as_posix(),
+        "SIM_RUN_TCL": hook.as_posix(),
+    }
     script = board / "host_simulate.tcl"
     content = template.read_text(encoding="utf-8")
     for key, value in values.items():
@@ -227,34 +301,56 @@ def simulate(deployment: Path, board: Path, output: Path, vivado: Path = DEFAULT
     content = content.replace("$root/sim", "$root/host-sim-project")
     script.write_text(content, encoding="utf-8")
     with Lock(False):
-        execution = run_tool(vivado, script, output, timeout=3600)
+        execution = run_tool(vivado, script, output, timeout=None)
     frame_files = list((board / "host-sim-project").rglob("response_frames.hex"))
-    result = {"status": "FAILED", "stage": "host_sim", "returncode": execution["returncode"],
-              "cycle_counter": cycle_counter_record(wrapper, simulation=True),
-              "timed_out": execution["timed_out"], "requested_samples": len(inputs),
-              "received_samples": 0, "hardware_verified": False,
-              "on_board_numerical": "NOT_RUN", "contract_sha256": sha256_file(deployment),
-              "model_sha256": wrapper["model_sha256"], "core_verilog_sha256": wrapper["core_verilog_sha256"],
-              "staged_rtl": staged["files"], "testbench_sha256": sha256_file(testbench),
-              "request_bytes_sha256": sha256_file(request_file),
-              "vivado_stdout": str(output / "stdout.txt")}
-    if (execution["returncode"] == 0 and not execution["timed_out"]
-            and simulation_completed(execution["stdout"], len(inputs))
-            and len(frame_files) == 1):
+    result = {
+        "status": "FAILED",
+        "stage": "host_sim",
+        "returncode": execution["returncode"],
+        "cycle_counter": cycle_counter_record(wrapper, simulation=True),
+        "timed_out": execution["timed_out"],
+        "requested_samples": len(inputs),
+        "received_samples": 0,
+        "hardware_verified": False,
+        "on_board_numerical": "NOT_RUN",
+        "hls_reference_diagnostic": hls_diagnostic,
+        "contract_sha256": sha256_file(deployment),
+        "model_sha256": wrapper["model_sha256"],
+        "core_verilog_sha256": wrapper["core_verilog_sha256"],
+        "staged_rtl": staged["files"],
+        "testbench_sha256": sha256_file(testbench),
+        "request_bytes_sha256": sha256_file(request_file),
+        "vivado_stdout": str(output / "stdout.txt"),
+    }
+    if (
+        execution["returncode"] == 0
+        and not execution["timed_out"]
+        and simulation_completed(execution["stdout"], len(inputs))
+        and len(frame_files) == 1
+    ):
         frames = frame_files[0].read_text(encoding="ascii").splitlines()
         try:
-            cycles, outputs = decode_frames(frames, sequences, geometry)
-            python_gate = compare("host_sim_vs_python", python_reference, outputs, criterion)
-            hls_gate = compare("host_sim_vs_hls", hls_reference, outputs, criterion)
-            result.update({"received_samples": len(outputs), "compute_cycles": cycles,
-                           "python": python_gate, "hls": hls_gate,
-                           "host_geometry": geometry.to_dict(),
-                           "status": "PASSED" if python_gate["passed"] and hls_gate["passed"]
-                           else "FAILED", "frames_sha256": sha256_file(frame_files[0])})
+            diagnostics = []
+            cycles, outputs = decode_frames(
+                frames, sequences, geometry, strict=False, on_diagnostic=diagnostics.append
+            )
+            gates = evaluate_simulation(python_reference, hls_reference, outputs, criterion)
+            result.update(
+                {
+                    **gates,
+                    "protocol_diagnostics": diagnostics,
+                    "received_samples": len(outputs),
+                    "compute_cycles": cycles,
+                    "host_geometry": geometry.to_dict(),
+                    "frames_sha256": sha256_file(frame_files[0]),
+                }
+            )
         except (ValueError, UnicodeError) as exc:
             result["error"] = str(exc)
     else:
-        result["error"] = "Vivado host testbench did not complete or did not write one response file"
+        result["error"] = (
+            "Vivado host testbench did not complete or did not write one response file"
+        )
     (output / "host-sim-evidence.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     return result
 

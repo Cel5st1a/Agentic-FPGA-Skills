@@ -6,11 +6,11 @@ This is the executable form of the stage order the skills document:
     P3  vitis-build-agent       csim      -> numeric gate (HLS C++ vs python reference)
                                 csynth    -> HLS resource estimate
                                 cosim     -> optional, recorded honestly if it does not finish
-        vivado-manager          wrapper   -> board-legal top + sample ROM + testbench
+        vivado-manager          wrapper   -> board top + sample ROM + testbench
                                 boardsim  -> synthesised RTL vs HLS C++ (per-value gate)
                                 synth/impl/bitstream -> routed gates + bitstream
         board-host-io           ports     -> routed top-port audit and I/O scope
-    P5  bitstream-package       package   -> refuses any build whose gates or port audit did not PASS
+    P5  bitstream-package       package   -> legacy packaging and audit
 
 Everything is read from the contract: model file(s), input shape, precision, reuse
 factor, strategy, io kind, clock period, board profile, sample file, resource limit.
@@ -27,7 +27,7 @@ python run_line.py --deployment <deployment.yaml> --run <run-dir> \
 Examples
 --------
 python run_line.py --deployment <run>/contract/<pkg>/deployment.yaml --run <run> --stop-after csim
-python run_line.py --deployment <run>/contract/<pkg>/deployment.yaml --run <run> --stages wrapper,boardsim
+python run_line.py --deployment <contract> --run <run> --stages wrapper,boardsim
 """
 
 from __future__ import annotations
@@ -169,7 +169,9 @@ def board_pin_profile(contract: dict, contract_path: Path, skills: Path) -> Path
     contract_profile_path = (contract_path.parent / value).resolve()
     contract_profile = load_yaml(contract_profile_path)
     ident = str(contract_profile.get("id") or contract_profile.get("board_id") or "").lower()
-    part = str(contract_profile.get("part") or (contract_profile.get("fpga") or {}).get("part") or "")
+    part = str(
+        contract_profile.get("part") or (contract_profile.get("fpga") or {}).get("part") or ""
+    )
 
     candidates = []
     for profile in sorted((skills / "board-profiles").rglob("board_profile.yaml")):
@@ -178,11 +180,14 @@ def board_pin_profile(contract: dict, contract_path: Path, skills: Path) -> Path
         profile_part = str(data.get("part") or (data.get("fpga") or {}).get("part") or "")
         if (ident and profile_id and ident == profile_id) or (part and part == profile_part):
             candidates.append(profile)
-        elif (ident and profile_id and ident in profile_id) or (profile_id and ident and profile_id in ident):
+        elif (ident and profile_id and ident in profile_id) or (
+            profile_id and ident and profile_id in ident
+        ):
             candidates.append(profile)
     if not candidates:
         raise SystemExit(
-            f"no board profile under {skills / 'board-profiles'} matches id={ident!r} part={part!r} "
+            f"no board profile under {skills / 'board-profiles'} "
+            f"matches id={ident!r} part={part!r} "
             f"(contract profile: {contract_profile_path})"
         )
     if len(candidates) > 1:
@@ -230,7 +235,7 @@ class Lock:
         self.acquired = False
         self.token = ""
 
-    def __enter__(self) -> "Lock":
+    def __enter__(self) -> Lock:
         if LOCK_PATH.exists():
             raw = LOCK_PATH.read_text(encoding="utf-8", errors="replace")
             holder = {}
@@ -240,7 +245,10 @@ class Lock:
                 pass
             pid = holder.get("pid")
             if pid and not _pid_alive(int(pid)):
-                print(f"[run_line] clearing a stale lock (pid {pid} is gone): {raw.strip()}", flush=True)
+                print(
+                    f"[run_line] clearing a stale lock (pid {pid} is gone): {raw.strip()}",
+                    flush=True,
+                )
                 LOCK_PATH.unlink()
             elif not self.force:
                 raise SystemExit(
@@ -269,15 +277,21 @@ class Lock:
         """Delegate this acquisition explicitly; OS ancestry is not an identity."""
         if not self.acquired:
             raise ValueError("EDA lock delegation requires an acquired lock")
-        return {**os.environ, "AFD_LINE_LOCK_PID": str(os.getpid()),
-                "AFD_LINE_LOCK_TOKEN": self.token}
+        return {
+            **os.environ,
+            "AFD_LINE_LOCK_PID": str(os.getpid()),
+            "AFD_LINE_LOCK_TOKEN": self.token,
+        }
 
     def __exit__(self, *_exc) -> None:
         if self.acquired and LOCK_PATH.exists():
             try:
                 holder = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-                if (holder.get("pid") == os.getpid() and
-                    holder.get("delegation_sha256") == hashlib.sha256(self.token.encode("ascii")).hexdigest()):
+                if (
+                    holder.get("pid") == os.getpid()
+                    and holder.get("delegation_sha256")
+                    == hashlib.sha256(self.token.encode("ascii")).hexdigest()
+                ):
                     LOCK_PATH.unlink()
             except (OSError, ValueError):
                 pass
@@ -297,9 +311,11 @@ def require_delegated_lock(path: Path) -> None:
 
     def refuse(reason):
         pid = holder.get("pid") if isinstance(holder, dict) else None
-        raise ValueError(f"EDA lock delegation refused: {reason}; lock={path}; "
-                         f"holder_pid={pid!r}; delegated_pid={owner!r}; "
-                         f"child_pid={os.getpid()}; child_ppid={os.getppid()}")
+        raise ValueError(
+            f"EDA lock delegation refused: {reason}; lock={path}; "
+            f"holder_pid={pid!r}; delegated_pid={owner!r}; "
+            f"child_pid={os.getpid()}; child_ppid={os.getppid()}"
+        )
 
     try:
         holder = json.loads(path.read_text(encoding="utf-8"))
@@ -311,9 +327,13 @@ def require_delegated_lock(path: Path) -> None:
     if type(pid) is not int or pid <= 0 or owner != str(pid):
         refuse("holder PID does not match explicit delegation")
     digest = holder.get("delegation_sha256")
-    if (not token or not isinstance(digest, str) or len(digest) != 64 or
-        any(c not in "0123456789abcdef" for c in digest) or
-        not secrets.compare_digest(hashlib.sha256(token.encode("utf-8")).hexdigest(), digest)):
+    if (
+        not token
+        or not isinstance(digest, str)
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+        or not secrets.compare_digest(hashlib.sha256(token.encode("utf-8")).hexdigest(), digest)
+    ):
         refuse("missing, mismatched or expired acquisition credential")
     if not _pid_alive(pid):
         refuse("lock holder is not alive")
@@ -323,7 +343,10 @@ def run(cmd: list[str], label: str, *, env=None) -> int:
     print(f"\n[run_line] {label}\n[run_line] $ {' '.join(str(c) for c in cmd)}", flush=True)
     started = time.monotonic()
     completed = subprocess.run([str(c) for c in cmd], env=env)
-    print(f"[run_line] {label} exit={completed.returncode} in {time.monotonic() - started:.1f}s", flush=True)
+    print(
+        f"[run_line] {label} exit={completed.returncode} in {time.monotonic() - started:.1f}s",
+        flush=True,
+    )
     return completed.returncode
 
 
@@ -376,7 +399,9 @@ def stage_verdict(stage: str, run_dir: Path) -> list[str]:
         if path.is_file():
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("status") == "FAILED":
-                problems.append(f"cosim-evidence.json status=FAILED reasons={payload.get('reasons')}")
+                problems.append(
+                    f"cosim-evidence.json status=FAILED reasons={payload.get('reasons')}"
+                )
         else:
             problems.append("cosim-evidence.json was not written")
     elif stage == "convert":
@@ -386,7 +411,9 @@ def stage_verdict(stage: str, run_dir: Path) -> list[str]:
         else:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("status") == "FAILED":
-                problems.append(f"convert-evidence.json status=FAILED reasons={payload.get('reasons')}")
+                problems.append(
+                    f"convert-evidence.json status=FAILED reasons={payload.get('reasons')}"
+                )
             elif not payload.get("hls4ml_config_path"):
                 problems.append("convert-evidence.json records no generated hls4ml config")
             elif not (run_dir / "p2-convert" / "project" / "build_prj.tcl").is_file():
@@ -401,7 +428,9 @@ def stage_verdict(stage: str, run_dir: Path) -> list[str]:
         else:
             scope = json.loads(path.read_text(encoding="utf-8"))
             checkpoint, wrapper = board / "routed.dcp", board / "wrapper.json"
-            if not checkpoint.is_file() or scope.get("checkpoint_sha256") != sha256_file(checkpoint):
+            if not checkpoint.is_file() or scope.get("checkpoint_sha256") != sha256_file(
+                checkpoint
+            ):
                 problems.append("io-scope checkpoint hash differs from routed.dcp")
             if not wrapper.is_file() or scope.get("wrapper_sha256") != sha256_file(wrapper):
                 problems.append("io-scope wrapper hash differs from wrapper.json")
@@ -419,18 +448,31 @@ def main() -> int:
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--stages", default=",".join(STAGE_ORDER))
     parser.add_argument("--stop-after", choices=SUPPORTED_STAGE_ORDER, default=None)
-    parser.add_argument("--model-id", default=None, help="defaults to the contract's model path stem")
+    parser.add_argument(
+        "--model-id", default=None, help="defaults to the contract's model path stem"
+    )
     parser.add_argument("--release-root", type=Path, default=DEFAULT_RELEASE_ROOT)
     parser.add_argument("--skills", type=Path, default=DEFAULT_SKILLS)
-    parser.add_argument("--python", type=Path, default=None,
-                        help="interpreter for the skills' scripts; defaults per model frontend "
-                             f"({', '.join(f'{k} -> {v.name}' for k, v in FRONTEND_PYTHON.items())})")
-    parser.add_argument("--timeout-csynth", type=int, default=7200)
-    parser.add_argument("--timeout-cosim", type=int, default=300,
-                        help="explicit diagnostic cosim budget; boardsim is the RTL numerical gate")
+    parser.add_argument(
+        "--python",
+        type=Path,
+        default=None,
+        help="interpreter for the skills' scripts; defaults per model frontend "
+        f"({', '.join(f'{k} -> {v.name}' for k, v in FRONTEND_PYTHON.items())})",
+    )
+    parser.add_argument("--timeout-csynth", type=int, default=None)
+    parser.add_argument(
+        "--timeout-cosim",
+        type=int,
+        default=None,
+        help="optional explicit diagnostic timeout; no default limit",
+    )
     parser.add_argument("--force-lock", action="store_true")
-    parser.add_argument("--reuse", action="store_true",
-                        help="allow regenerating artifacts that already exist in the run dir")
+    parser.add_argument(
+        "--reuse",
+        action="store_true",
+        help="allow regenerating artifacts that already exist in the run dir",
+    )
     parser.add_argument("--dry-run", action="store_true", help="print the commands, run nothing")
     args = parser.parse_args()
 
@@ -450,7 +492,11 @@ def main() -> int:
         raise SystemExit(f"unknown stages: {unknown}; known: {list(SUPPORTED_STAGE_ORDER)}")
     stages = [s for s in SUPPORTED_STAGE_ORDER if s in stages]
     if args.stop_after:
-        stages = [s for s in stages if SUPPORTED_STAGE_ORDER.index(s) <= SUPPORTED_STAGE_ORDER.index(args.stop_after)]
+        stages = [
+            s
+            for s in stages
+            if SUPPORTED_STAGE_ORDER.index(s) <= SUPPORTED_STAGE_ORDER.index(args.stop_after)
+        ]
     if not stages:
         raise SystemExit("no stages selected")
 
@@ -472,14 +518,22 @@ def main() -> int:
         if not Path(args.python).is_file():
             raise SystemExit(f"the {frontend} conversion environment is missing: {args.python}")
         keras_major = detect_keras_major(model_path)
-        print(json.dumps({
-            "interpreter_resolved": str(args.python),
-            "frontend": frontend,
-            "model_keras_major": keras_major,
-            "reason": ("archive declares Keras 3; the legacy env cannot deserialise it"
-                       if keras_major == 3 else
-                       "frontend default (no Keras 3 declaration in the model file)"),
-        }, indent=2), flush=True)
+        print(
+            json.dumps(
+                {
+                    "interpreter_resolved": str(args.python),
+                    "frontend": frontend,
+                    "model_keras_major": keras_major,
+                    "reason": (
+                        "archive declares Keras 3; the legacy env cannot deserialise it"
+                        if keras_major == 3
+                        else "frontend default (no Keras 3 declaration in the model file)"
+                    ),
+                },
+                indent=2,
+            ),
+            flush=True,
+        )
 
     def converter() -> Path:
         if frontend in {"keras_json_weights", "qkeras_json_weights", "keras_h5", "keras_archive"}:
@@ -512,11 +566,24 @@ def main() -> int:
         return files[0].stem
 
     def wrapper_command() -> list[str]:
-        command = [args.python, skills / "vivado-manager" / "scripts" / "make_board_wrapper.py",
-                   "--deployment", contract_path, "--verilog-dir", verilog_dir, "--top", top_name(),
-                   "--output", board, "--board-profile", pins_profile, "--force"]
+        command = [
+            args.python,
+            skills / "vivado-manager" / "scripts" / "make_board_wrapper.py",
+            "--deployment",
+            contract_path,
+            "--verilog-dir",
+            verilog_dir,
+            "--top",
+            top_name(),
+            "--output",
+            board,
+            "--board-profile",
+            pins_profile,
+            "--force",
+        ]
         command += ["--reference-json", evidence / "python-output.json"]
         return command
+
     pins_profile = board_pin_profile(contract, contract_path, skills)
     inputs_json = (contract_path.parent / contract["verification"]["inputs"]).resolve()
     reference_json = evidence / "python-output.json"
@@ -524,18 +591,39 @@ def main() -> int:
 
     def build_plan_entry(stage: str) -> list[str]:
         if stage == "convert":
-            return [args.python, converter(), "--deployment", contract_path, "--output", project,
-                    "--inputs", inputs_json, "--reference-out", reference_json,
-                    "--evidence", evidence / "convert-evidence.json"]
+            return [
+                args.python,
+                converter(),
+                "--deployment",
+                contract_path,
+                "--output",
+                project,
+                "--inputs",
+                inputs_json,
+                "--reference-out",
+                reference_json,
+                "--evidence",
+                evidence / "convert-evidence.json",
+            ]
         if stage in {"csim", "csynth", "cosim"}:
             command = [
-                args.python, skills / "vitis-build-agent" / "scripts" / "run_stage.py",
-                "--stage", stage, "--project", project, "--work", run_dir / "p3-build" / stage,
-                "--deployment", contract_path, "--evidence", evidence / f"{stage}-evidence.json",
+                args.python,
+                skills / "vitis-build-agent" / "scripts" / "run_stage.py",
+                "--stage",
+                stage,
+                "--project",
+                project,
+                "--work",
+                run_dir / "p3-build" / stage,
+                "--deployment",
+                contract_path,
+                "--evidence",
+                evidence / f"{stage}-evidence.json",
             ]
             if stage in {"csim", "cosim"}:
                 command += ["--reference", reference_json]
-            return command + ["--timeout", args.timeout_cosim if stage == "cosim" else args.timeout_csynth]
+            timeout = args.timeout_cosim if stage == "cosim" else args.timeout_csynth
+            return command + (["--timeout", timeout] if timeout is not None else [])
         if stage == "wrapper":
             # --force regenerates only the wrapper's own outputs in place. The driver's
             # stale-artifact guard (see below) is what decides whether re-running at all
@@ -544,36 +632,87 @@ def main() -> int:
             # csynth generated, so they are resolved when the stage runs.
             return wrapper_command()
         if stage == "boardsim":
-            return [args.python, skills / "vivado-manager" / "scripts" / "run_board_sim.py",
-                    "--board", board, "--deployment", contract_path,
-                    "--reference", csim_log, "--work", board,
-                    "--evidence", evidence / "board-sim-evidence.json"]
+            return [
+                args.python,
+                skills / "vivado-manager" / "scripts" / "run_board_sim.py",
+                "--board",
+                board,
+                "--deployment",
+                contract_path,
+                "--reference",
+                csim_log,
+                "--work",
+                board,
+                "--evidence",
+                evidence / "board-sim-evidence.json",
+            ]
         if stage in {"synth", "impl", "bitstream"}:
-            return [args.python, skills / "vivado-manager" / "scripts" / "run_vivado.py",
-                    "--stage", stage, "--board", board, "--deployment", contract_path,
-                    "--work", board, "--evidence", evidence / f"vivado-{stage}-evidence.json"]
+            return [
+                args.python,
+                skills / "vivado-manager" / "scripts" / "run_vivado.py",
+                "--stage",
+                stage,
+                "--board",
+                board,
+                "--deployment",
+                contract_path,
+                "--work",
+                run_dir / "p3-build" / "vivado-logs" / stage,
+                "--evidence",
+                evidence / f"vivado-{stage}-evidence.json",
+            ]
         if stage == "ports":
-            return [args.python, skills / "board-host-io" / "scripts" / "audit_ports.py",
-                    "--routed-dcp", board / "routed.dcp", "--wrapper", board / "wrapper.json",
-                    "--output", evidence / "io-port-audit", "--allow-configure-only",
-                    "--under-line-lock"]
+            return [
+                args.python,
+                skills / "board-host-io" / "scripts" / "audit_ports.py",
+                "--routed-dcp",
+                board / "routed.dcp",
+                "--wrapper",
+                board / "wrapper.json",
+                "--output",
+                evidence / "io-port-audit",
+                "--allow-configure-only",
+                "--under-line-lock",
+            ]
         if stage == "package":
             # --force replaces an existing <release-root>/<model-id>. The driver only gets
             # here when every stage's evidence passed, and the packager re-verifies the
             # gates, the artifacts and the bitstream before writing anything, so replacing
             # a previous delivery is the intended behaviour.
-            return [args.python, skills / "bitstream-package" / "scripts" / "package_bitstream.py",
-                    "--run", run_dir, "--model-id", model_id, "--release-root", args.release_root,
-                    "--force"]
+            return [
+                args.python,
+                skills / "bitstream-package" / "scripts" / "package_bitstream.py",
+                "--run",
+                run_dir,
+                "--model-id",
+                model_id,
+                "--release-root",
+                args.release_root,
+                "--force",
+            ]
         raise SystemExit(f"no command for stage {stage!r}")
 
     # Each entry is a thunk: the wrapper stage needs the Verilog that csynth generates, so
     # commands are resolved when the stage runs, not when the plan is assembled.
-    plan: list[tuple[str, object]] = [(stage, (lambda s=stage: build_plan_entry(s))) for stage in stages]
+    plan: list[tuple[str, object]] = [
+        (stage, (lambda s=stage: build_plan_entry(s))) for stage in stages
+    ]
 
-    print(json.dumps({"run": str(run_dir), "contract": str(contract_path), "model_id": model_id,
-                      "stages": stages, "board_pins_profile": str(pins_profile),
-                      "python": str(args.python)}, indent=2, ensure_ascii=False), flush=True)
+    print(
+        json.dumps(
+            {
+                "run": str(run_dir),
+                "contract": str(contract_path),
+                "model_id": model_id,
+                "stages": stages,
+                "board_pins_profile": str(pins_profile),
+                "python": str(args.python),
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
     if args.dry_run:
         for stage, builder in plan:
             try:
@@ -612,10 +751,15 @@ def main() -> int:
             for key in ("contract_sha256", "board_profile_sha256", "board_pins_profile_sha256"):
                 if key in frozen and frozen[key] != identity[key]:
                     raise SystemExit(f"{key} changed since {frozen_path}; use a new run")
-    plan_record = {**identity, "skills_root": str(skills), "stages": stages,
-                   "python": str(args.python)}
+    plan_record = {
+        **identity,
+        "skills_root": str(skills),
+        "stages": stages,
+        "python": str(args.python),
+    }
     (run_dir / "run-plan.json").write_text(
-        json.dumps(plan_record, indent=2, ensure_ascii=False), encoding="utf-8")
+        json.dumps(plan_record, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
 
     needs_eda = any(stage in EDA_STAGES for stage in stages)
     results: list[dict] = []
@@ -626,17 +770,27 @@ def main() -> int:
         return _execute(plan, results, run_dir, context, identity=identity)
 
 
-def _execute(plan, results: list[dict], run_dir: Path, lock: Lock | None = None,
-             identity: dict | None = None) -> int:
+def _execute(
+    plan, results: list[dict], run_dir: Path, lock: Lock | None = None, identity: dict | None = None
+) -> int:
     for stage, builder in plan:
         command = builder()
-        code = (run(command, stage, env=lock.child_environment())
-                if stage == "ports" and lock is not None else run(command, stage))
+        code = (
+            run(command, stage, env=lock.child_environment())
+            if stage == "ports" and lock is not None
+            else run(command, stage)
+        )
         if identity:
-            evidence_names = {"convert": "convert-evidence.json", "csim": "csim-evidence.json",
-                "csynth": "csynth-evidence.json", "cosim": "cosim-evidence.json",
-                "boardsim": "board-sim-evidence.json", "synth": "vivado-synth-evidence.json",
-                "impl": "vivado-impl-evidence.json", "bitstream": "vivado-bitstream-evidence.json"}
+            evidence_names = {
+                "convert": "convert-evidence.json",
+                "csim": "csim-evidence.json",
+                "csynth": "csynth-evidence.json",
+                "cosim": "cosim-evidence.json",
+                "boardsim": "board-sim-evidence.json",
+                "synth": "vivado-synth-evidence.json",
+                "impl": "vivado-impl-evidence.json",
+                "bitstream": "vivado-bitstream-evidence.json",
+            }
             name = evidence_names.get(stage)
             path = run_dir / "evidence" / name if name else None
             if path and path.is_file():

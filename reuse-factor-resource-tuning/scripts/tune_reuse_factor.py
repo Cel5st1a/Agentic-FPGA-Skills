@@ -1,27 +1,8 @@
 #!/usr/bin/env python
-"""Reuse-factor tuning aid: locate the area-dominating layer and pick a legal factor.
+"""Read actual generated Dense/Conv reuse factors and complete Softmax scheduling knobs.
 
-Read-only analysis. Runs no EDA tool. Answers, before a 13-minute Vivado run is spent:
-
-  * which layers have a reuse-factor lever, and what each one costs today,
-  * the reuse factors hls4ml will actually accept, per layer,
-  * which layer owns the area, and what changing its factor would buy,
-  * the exact contract variant and commands to act on it.
-
-Design rules (same as the rest of this skill tree):
-  * Generic. No model name, layer name, shape or precision appears in this file.
-    Everything comes from the deployment contract and the generated firmware.
-  * Memoryless. Absolute paths on the command line; one JSON out.
-  * No acceptance claim. This predicts; the RTL and the resource gate measure.
-  * Read-only. It never writes into a run directory and never runs a tool.
-
-Usage:
-  python tune_reuse_factor.py --deployment <contract.yaml>
-                             --parameters <p2-convert/project/firmware/parameters.h>
-                             [--utilization <utilization_synth.rpt>]
-                             [--out <report.json>]
-
-Exit codes: 0 report written; 2 bad input; 3 nothing to tune.
+No EDA, contract changes, measured-resource claims, or mandatory full-pipeline reruns.
+Reports are immutable attempts; all estimates are explicitly separate from measurements.
 """
 
 from __future__ import annotations
@@ -79,6 +60,7 @@ def hls4ml_valid_reuse_factors():
 
         return valid, f"hls4ml {hls4ml.__version__} FPGABackend._validate_reuse_factor"
     except Exception as exc:  # pragma: no cover - fallback path
+
         def valid(n_in: int, n_out: int, rf: int) -> bool:
             multfactor = min(n_in, rf)
             multiplier_limit = int(math.ceil((n_in * n_out) / float(multfactor)))
@@ -97,23 +79,10 @@ def valid_factors(n_in: int, n_out: int, valid) -> list[int]:
 
 
 def multiplier_count(n_in: int, n_out: int, rf: int) -> int:
-    """Multiplier instances the kernel emits.
+    """Dense/Conv arithmetic-model estimate ceil(MACs/RF), not a physical count.
 
-        rf <= n_in : ceil(MACs / rf)       (DenseResource_rf_leq_nin; rf is also the block)
-        rf >  n_in : ceil(MACs / rf)       (DenseResource_rf_gt_nin_rem0) -- still /rf, not
-                                           /n_in: the `MULT` block has one statement per
-                                           reuse-loop step, and the generated
-                                           `multiplier_limit = DIV_ROUNDUP(n_in*n_out, rf)`
-                                           says the same thing. Measured on `mlp_64_32`'s
-                                           32x4 `latent` at rf=64: 2 realised, and the config
-                                           itself reads `DIV_ROUNDUP(128, 64)` = 2.
-
-    So one expression covers both kernel variants, and it agrees with the generated
-    `multiplier_limit` in every case checked.
-
-    Measured exact for rf >= 2 on two independent models. At rf = 1 it is an UPPER BOUND:
-    Vitis shares some multipliers (1024 predicted vs 426 realised on `asymmetric_cnn_fc`),
-    so a prediction is never a result.
+    Compare with emitted_multiplier_limit where available; zero-weight removal,
+    backend sharing and mapping can change the actual hardware. RF is not latency.
     """
     return int(math.ceil((n_in * n_out) / float(rf)))
 
@@ -146,16 +115,18 @@ def emitted_multiplier_limit(body: str):
     the struct's own integers. This is the firmware's own statement of how many parallel
     multipliers the kernel is built with, which makes it an independent check on
     `multiplier_count` rather than a second copy of it: if the two ever disagree, the
-    generated limit wins and the prediction is wrong.
+    generated expression wins as a declaration. Neither value proves physical sharing;
+    the selected kernel and synthesized mapping still govern that claim.
     """
     m = re.search(r"static\s+const\s+unsigned\s+multiplier_limit\s*=\s*([^;]+);", body)
     if not m:
         return None
-    expr = m.group(1).strip()
-    fields = {
-        name: _unsigned(body, name)
-        for name in ("n_in", "n_out", "reuse_factor", "n_zeros")
-    }
+    expression = re.sub(r"\s+", "", m.group(1))
+    if expression.isdigit():
+        return int(expression)
+    if expression != "DIV_ROUNDUP(n_in*n_out,reuse_factor)-n_zeros/reuse_factor":
+        return None
+    fields = {name: _unsigned(body, name) for name in ("n_in", "n_out", "reuse_factor", "n_zeros")}
     if any(not isinstance(value, int) for value in fields.values()):
         return None
     if fields["reuse_factor"] <= 0:
@@ -227,20 +198,24 @@ def parse_parameters(path: Path) -> dict:
     text = path.read_text(encoding="utf-8", errors="replace")
     structs = list(_iter_structs(text))
 
-    conv_structs = {name for _c, name, base, _b in structs if base.endswith("conv1d_config")}
+    conv_structs = {
+        name for _c, name, base, _b in structs if base.endswith(("conv1d_config", "conv2d_config"))
+    }
     mult_names = {f"{name}_mult" for name in conv_structs}
 
-    conv_records: dict[str, dict] = {}   # conv struct name -> record
-    mult_records: dict[str, dict] = {}   # conv struct name -> its multiply block
-    records: dict[str, dict] = {}        # final layer name -> record
+    conv_records: dict[str, dict] = {}  # conv struct name -> record
+    mult_records: dict[str, dict] = {}  # conv struct name -> its multiply block
+    records: dict[str, dict] = {}  # final layer name -> record
 
     for comment, name, base, body in structs:
         n_in, n_out = _unsigned(body, "n_in"), _unsigned(body, "n_out")
         reuse_factor = _unsigned(body, "reuse_factor")
 
-        if base.endswith("conv1d_config"):
+        if base.endswith(("conv1d_config", "conv2d_config")):
             record = {
                 "kind": "conv",
+                "spatial_dimensions": 2 if base.endswith("conv2d_config") else 1,
+                "filt_height": _unsigned(body, "filt_height"),
                 "layer": comment or name,
                 "struct": name,
                 "reuse_factor": reuse_factor,
@@ -256,9 +231,14 @@ def parse_parameters(path: Path) -> dict:
         if base.endswith("dense_config") and n_in is not None and n_out is not None:
             kernel_m = KERNEL_RE.search(body)
             kernel = kernel_m.group(1) if kernel_m else None
-            block = {"struct": name, "n_in": n_in, "n_out": n_out,
-                     "reuse_factor": reuse_factor, "kernel": kernel,
-                     "emitted_multiplier_limit": emitted_multiplier_limit(body)}
+            block = {
+                "struct": name,
+                "n_in": n_in,
+                "n_out": n_out,
+                "reuse_factor": reuse_factor,
+                "kernel": kernel,
+                "emitted_multiplier_limit": emitted_multiplier_limit(body),
+            }
             if name in mult_names:
                 # The multiply block's comment carries the real HLS layer name
                 # (`// encoder_conv_0` above `struct config3_mult`), while the conv's own
@@ -285,12 +265,61 @@ def parse_parameters(path: Path) -> dict:
 
 
 # --------------------------------------------------------------------------------------
-def effective_factor(layer: str, contract: dict) -> int:
-    """The factor a layer actually gets: its own override, else the contract's global."""
+def factor_request(layer: str, contract: dict) -> dict:
+    """Resolve explicit requests, not emitted values; unknown LayerType is never guessed."""
+
+    def result(value, source, conflict=False):
+        valid = type(value) is int and value > 0
+        if isinstance(value, str) and value.isdigit() and int(value) > 0:
+            value, valid = int(value), True
+        return {
+            "value": value if valid and not conflict else None,
+            "source": source,
+            "conflict": conflict,
+        }
+
+    def without_nulls(value):
+        if isinstance(value, dict):
+            return {k: without_nulls(v) for k, v in value.items() if v is not None}
+        return value
+
+    config = without_nulls(contract.get("hls_config") or {})
     overrides = contract.get("layer_reuse_factors") or {}
-    if layer in overrides:
-        return int(overrides[layer])
-    return int(contract.get("reuse_factor"))
+    if not isinstance(config, dict) or not isinstance(overrides, dict):
+        return result(None, "invalid_mapping")
+    layers = config.get("LayerName") or {}
+    if not isinstance(layers, dict):
+        return result(None, "invalid_mapping")
+    own = [v for k, v in overrides.items() if str(k).lower() == layer.lower()]
+    named = [v for k, v in layers.items() if str(k).lower() == layer.lower()]
+    if len(own) > 1 or len(named) > 1:
+        return result(None, "ambiguous_layer", True)
+    block = named[0] if named else {}
+    if not isinstance(block, dict):
+        return result(None, "invalid_mapping")
+    named_rf = block.get("ReuseFactor")
+    if own and named_rf is not None and own[0] != named_rf:
+        return result(None, "conflicting_layer_requests", True)
+    if own:
+        return result(own[0], "layer_reuse_factors")
+    if named_rf is not None:
+        return result(named_rf, "hls_config.LayerName")
+    types = config.get("LayerType") or {}
+    if not isinstance(types, dict):
+        return result(None, "invalid_mapping")
+    if any(isinstance(v, dict) and "ReuseFactor" in v for v in types.values()):
+        return result(None, "unknown_layer_type")
+    model = config.get("Model") or {}
+    if not isinstance(model, dict):
+        return result(None, "invalid_mapping")
+    global_rf = contract.get("reuse_factor")
+    if "ReuseFactor" in model and model["ReuseFactor"] != global_rf:
+        return result(None, "conflicting_global_requests", True)
+    return result(global_rf, "global")
+
+
+def effective_factor(layer: str, contract: dict):
+    return factor_request(layer, contract)["value"]
 
 
 def lever_dims(rec: dict):
@@ -308,217 +337,176 @@ def lever_dims(rec: dict):
         if rec.get("mult_n_in") is not None and rec.get("mult_n_out") is not None:
             return int(rec["mult_n_in"]), int(rec["mult_n_out"])
         try:
-            return int(rec["filt_width"]) * int(rec["n_chan"]), int(rec["n_filt"])
+            height = int(rec["filt_height"]) if rec.get("spatial_dimensions", 1) == 2 else 1
+            return height * int(rec["filt_width"]) * int(rec["n_chan"]), int(rec["n_filt"])
         except (TypeError, ValueError):
             return None
     return None
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--deployment", type=Path, required=True)
-    parser.add_argument("--parameters", type=Path, required=True,
-                        help="the generated firmware/parameters.h of the run that blocked")
-    parser.add_argument("--utilization", type=Path, default=None,
-                        help="optional utilization_synth.rpt, to attribute the overage")
-    parser.add_argument("--out", type=Path, default=None)
-    args = parser.parse_args()
+def candidate_costs(n_in: int, n_out: int, factors: list[int]) -> list[dict]:
+    """Arithmetic estimates only; reuse factors are not measured latency."""
+    return [
+        {
+            "reuse_factor": rf,
+            "predicted_multipliers": multiplier_count(n_in, n_out, rf),
+            "measured_latency_cycles": None,
+            "measured_resources": None,
+        }
+        for rf in factors
+    ]
 
+
+def sharing_diagnostic(rec: dict) -> dict:
+    kernel = rec.get("kernel")
+    applicable = None
+    if kernel == "DenseLatency":
+        applicable = False
+    elif kernel in (KERNEL_LEQ_NIN, KERNEL_GT_NIN):
+        applicable = True
+    return {
+        "kernel": kernel,
+        "rf_sharing_estimate_applicable": applicable,
+        "measured_multiplier_count": None,
+        "note": "DenseLatency does not establish Resource-kernel sharing from RF alone. "
+        "Inspect emitted strategy/kernel, HLS schedule and actual synthesized mapping before "
+        "repeating implementation. Unknown kernels remain unknown; even a Resource kernel "
+        "does not make arithmetic estimates physical measurements.",
+    }
+
+
+def softmax_scheduling(path: Path) -> list[dict]:
+    records = []
+    for comment, name, _base, body in _iter_structs(path.read_text(encoding="utf-8")):
+        if "softmax" not in name.lower() and "softmax_implementation" not in body:
+            continue
+        lanes = _unsigned(body, "n_in")
+        factors = [None, 1]
+        factors += [f for f in (2, 4) if isinstance(lanes, int) and f <= lanes]
+        records.append(
+            {
+                "layer": comment or name,
+                "struct": name,
+                "elements": lanes,
+                "exp_table_size": _unsigned(body, "exp_table_size"),
+                "inv_table_size": _unsigned(body, "inv_table_size"),
+                "recommended_factor": None,
+                "choices": [{"softmax_exp_read_factor": factor} for factor in factors],
+                "measured_resources": None,
+                "measured_latency_cycles": None,
+                "note": "None preserves current scheduling. Factor 1 limits exponent-table read "
+                "unrolling; finite factors trade parallel reads for scheduling. Converter "
+                "support is checked before patching. Keep complete exp/sum/normalization; "
+                "measure each candidate before selecting. No universal fastest factor.",
+            }
+        )
+    return records
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Read-only RF and full-Softmax scheduling advice")
+    parser.add_argument("--deployment", type=Path, required=True)
+    parser.add_argument("--parameters", type=Path, required=True)
+    parser.add_argument("--utilization", type=Path)
+    parser.add_argument("--out", type=Path)
+    args = parser.parse_args()
     contract_path, params_path = args.deployment.resolve(), args.parameters.resolve()
     for path in (contract_path, params_path):
         if not path.is_file():
             raise SystemExit(f"not a file: {path}")
-
+    if args.out and args.out.exists():
+        raise SystemExit("advice output exists; use a fresh attempt path")
     contract = read_yaml(contract_path)
     valid, provenance = hls4ml_valid_reuse_factors()
-    layers = parse_parameters(params_path)
-    if not layers:
-        raise SystemExit(f"no lever-bearing layers found in {params_path}")
-    limit = float((contract.get("constraints") or {}).get("resource_fraction_max", 0.8))
-
+    layers, scheduling = parse_parameters(params_path), softmax_scheduling(params_path)
+    if not layers and not scheduling:
+        raise SystemExit("no supported Dense/Conv reuse or Softmax scheduling knobs found")
     rows = []
     for layer, rec in sorted(layers.items()):
         dims = lever_dims(rec)
+        requested = effective_factor(layer, contract)
+        actual = rec.get("mult_reuse_factor", rec.get("reuse_factor"))
         entry = {
             "layer": layer,
             "kind": rec["kind"],
             "struct": rec["struct"],
-            "factor_in_firmware": rec.get("reuse_factor"),
-            "factor_effective": effective_factor(layer, contract),
-            "has_override": layer in (contract.get("layer_reuse_factors") or {}),
-            "kernel": rec.get("kernel"),
+            "sharing_diagnostic": sharing_diagnostic(rec),
+            "requested_factor": requested,
+            "requested_factor_resolution": factor_request(layer, contract),
+            "factor_in_firmware": actual,
+            "request_matches_firmware": actual == requested if requested is not None else None,
+            "measured_latency_cycles": None,
+            "measured_resources": None,
         }
-        if dims:
+        if factor_request(layer, contract)["source"] == "global":
+            entry["factor_inherited_from_global"] = True
+        if dims and isinstance(actual, int) and actual > 0:
             n_in, n_out = dims
-            rf = entry["factor_effective"]
-            entry["multiplier_inputs"] = {"n_in": n_in, "n_out": n_out, "macs": n_in * n_out}
-            entry["predicted_multipliers_now"] = multiplier_count(n_in, n_out, rf)
-            entry["cycles_now"] = rf
-            # Cross-check the prediction against the limit the generator itself emitted.
-            emitted = rec.get("emitted_multiplier_limit")
-            if emitted is not None:
-                entry["emitted_multiplier_limit"] = emitted
-                entry["prediction_agrees_with_firmware"] = emitted == entry["predicted_multipliers_now"]
-            valid_set = valid_factors(n_in, n_out, valid)
-            entry["valid_factors"] = valid_set
-            entry["factor_now_is_valid"] = rf in valid_set
-            candidates = [r for r in valid_set if r >= rf] or valid_set[-1:]
-            picks = []
-            for cand in candidates:
-                pred = multiplier_count(n_in, n_out, cand)
-                picks.append({"factor": cand, "predicted_multipliers": pred,
-                              "cycles": cand,
-                              "shrink_vs_now": (entry["predicted_multipliers_now"] / pred)
-                              if pred else None})
-            entry["candidates"] = picks
-            # Recommend the smallest legal factor that already achieves the layer's MINIMUM
-            # multiplier count. Rationale, all measured:
-            #   * "the next factor up" is not a fix: on a 256x4 Dense the smallest increase is
-            #     rf=2 -> 512 multipliers, built and measured at LUT 1.33x / DSP 2.89x, still
-            #     no fit, while rf=256 -> 4 multipliers fits with ~6x headroom;
-            #   * the largest legal factor is also not the answer: on that same layer it is
-            #     rf=1024 -> 1 multiplier, which buys nothing over rf=256 (4 multipliers) and
-            #     costs 4x the cycles. The gain vanishes once the count stops falling;
-            #   * a purely relative target cannot find this, because whether the minimum is
-            #     reached depends on the layer's shape, not on its current overage.
-            # Recommend the smallest legal factor that reaches the layer's theoretical
-            # minimum multiplier count, which is one multiplier per output (`n_out`): the
-            # count is ceil(MACs / rf), so it stops falling once rf >= MACs / n_out.
-            #
-            # Derived rather than searched, and each edge is measured:
-            #   * "the next factor up" is not a fix -- on a 256x4 Dense the smallest increase
-            #     is rf=2 -> 512 multipliers (built: LUT 1.33x, DSP 2.89x, still no fit);
-            #   * the largest legal factor is not the answer either -- rf=1024 -> 1 multiplier
-            #     buys nothing over rf=256 -> 4 and costs 4x the cycles;
-            #   * going below one-per-output is impossible, so capping at n_out is the floor.
-            macs = entry["multiplier_inputs"]["macs"]
-            needed = -(-macs // n_out)  # smallest rf reaching n_out multipliers
-            entry["minimum_predicted_multipliers"] = n_out
-            entry["factor_for_minimum_multipliers"] = needed
-            at_or_above = [p["factor"] for p in picks if p["factor"] >= needed]
-            if at_or_above:
-                entry["recommended_factor"] = min(at_or_above)
-                entry["recommendation_note"] = (
-                    f"rf={needed} is the smallest factor reaching the layer's minimum of "
-                    f"{n_out} multiplier(s) (one per output); larger factors reduce nothing "
-                    "and only add cycles."
-                )
-            else:
-                # No legal factor reaches the floor; take the largest legal one.
-                entry["recommended_factor"] = picks[-1]["factor"]
-                entry["recommendation_note"] = (
-                    f"no legal factor reaches the {n_out}-multiplier floor for this shape; the "
-                    "largest legal factor is proposed. If the design still does not fit, this "
-                    "layer's lever is exhausted -- change io_type or precision (both need the "
-                    "numerical gates re-earned), or conclude it does not fit the part."
-                )
-            # Flag a layer living on a factor inherited from the global, which is how a
-            # Dense layer silently ends up fully parallel when the global is lowered for
-            # some other layer's sake.
-            if not entry["has_override"]:
-                entry["factor_inherited_from_global"] = True
-                entry["inheritance_warning"] = (
-                    f"'{layer}' has no layer_reuse_factors entry, so it inherits the "
-                    f"contract's global reuse_factor={contract.get('reuse_factor')}. If the "
-                    "global factor was lowered to satisfy a different layer, this layer was "
-                    "lowered with it."
-                )
+            factors = valid_factors(n_in, n_out, valid)
+            picks = candidate_costs(n_in, n_out, factors)
+            entry.update(
+                multiplier_inputs={"n_in": n_in, "n_out": n_out},
+                valid_factors=factors,
+                candidates=picks,
+                predicted_multipliers_now=(
+                    None
+                    if sharing_diagnostic(rec)["rf_sharing_estimate_applicable"] is False
+                    else multiplier_count(n_in, n_out, actual)
+                ),
+                candidate_scope="hypothetical arithmetic model, not measured physical sharing",
+                emitted_multiplier_limit=rec.get("emitted_multiplier_limit"),
+                minimum_predicted_multipliers=min(
+                    (x["predicted_multipliers"] for x in picks), default=None
+                ),
+                recommended_factor=None,
+            )
         rows.append(entry)
-
-    ranked = sorted(rows, key=lambda r: r.get("predicted_multipliers_now", 0), reverse=True)
-    top = ranked[0] if ranked and ranked[0].get("predicted_multipliers_now") else None
-
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "skill": "reuse-factor-resource-tuning",
+        "eda_executed": False,
+        "hardware_verified": False,
         "deployment": {"path": str(contract_path), "sha256": sha256_file(contract_path)},
         "parameters": {"path": str(params_path), "sha256": sha256_file(params_path)},
         "validity_predicate": provenance,
         "contract": {
-            "precision": contract.get("precision"),
             "reuse_factor_global": contract.get("reuse_factor"),
-            "layer_reuse_factors": contract.get("layer_reuse_factors") or {},
-            "io_type": contract.get("io_type"),
-            "resource_fraction_max": limit,
+            "precision": contract.get("precision"),
+            "resource_fraction_max": (contract.get("constraints") or {}).get(
+                "resource_fraction_max"
+            ),
         },
-        "layers": rows,
-        "area_dominating_layer": top["layer"] if top else None,
-        "numerical_effect": (
-            "none expected in value, but the firmware changes, so convert and csim must be "
-            "re-run on a NEW run directory and the verdict re-earned from the new evidence. "
-            "Reuse factor can only change a result by REORDERING accumulator additions; "
-            "factors that preserve the order are bit-identical, ones that interleave are not."
-        ),
-        "prediction_caveat": (
-            "predicted_multipliers is exact for factor >= 2 and an upper bound at factor 1, "
-            "where Vitis shares multipliers. The RTL and the resource gate are the "
-            "authority; this only chooses what to try."
-        ),
         "refusals": [
-            "This tool never proposes lowering the contract's global reuse_factor.",
-            "It never changes precision, resource_fraction_max, or the numerical criterion.",
-            "It never writes into a run directory; act through make_contract_variant.py and a new run id.",
+            "This read-only tool never proposes lowering the global factor.",
+            "It never changes precision, resource_fraction_max, or numerical acceptance.",
         ],
+        "layers": rows,
+        "softmax_scheduling": scheduling,
+        "measured_resources": None,
+        "measured_latency_cycles": None,
+        "prediction_caveat": "Multiplier estimates describe a kernel arithmetic model, "
+        "not physical resources or capacity. Backend sharing, zero weights and scheduling "
+        "can alter mapping. RF is not measured latency. No automatic winner is selected.",
+        "acceptance": "Complete original model, 256 complete board outputs, original Python "
+        "abs(error)<=.001+.001*abs(ref). Resource/timing/HLS/cosim are diagnostics.",
+        "next_action": "Only if a change is needed: keep existing attempts, change one knob, "
+        "and regenerate its affected artifacts. Keep a valid core for shell-only fixes. "
+        "Do not rerun accepted deployments for optional measurements.",
     }
-
-    if top and top.get("recommended_factor") and top.get("has_override") is not None:
-        overrides = dict(contract.get("layer_reuse_factors") or {})
-        overrides[top["layer"]] = top["recommended_factor"]
-        report["recommendation"] = {
-            "layer": top["layer"],
-            "factor_now": top["factor_effective"],
-            "factor_proposed": top["recommended_factor"],
-            "predicted_multipliers_now": top["predicted_multipliers_now"],
-            "predicted_multipliers_after": multiplier_count(
-                *lever_dims(layers[top["layer"]]), top["recommended_factor"]
-            ),
-            "layer_reuse_factors": overrides,
-            "make_variant": (
-                "python make_contract_variant.py --deployment <contract> --name <variant> "
-                f"--set 'layer_reuse_factors={json.dumps(overrides)}'"
-            ),
-            "then": (
-                "python bootstrap_run.py --deployment <variant contract> --run <NEW run id>; "
-                "then run_line.py with convert,csim,csynth,wrapper,boardsim,synth,impl,"
-                "bitstream,package"
-            ),
-            "verify_after": (
-                "count `myproject_mul_` instantiations in p2-convert/project/myproject_prj/"
-                "solution1/syn/verilog/ and compare with predicted_multipliers_after"
-            ),
-        }
-
-    if args.utilization and args.utilization.is_file():
+    if args.utilization:
+        if not args.utilization.is_file():
+            raise SystemExit(f"not a file: {args.utilization}")
         report["utilization_input"] = {
             "path": str(args.utilization.resolve()),
-            "sha256": sha256_file(args.utilization.resolve()),
-            "note": "read-only context; the gate verdict belongs to vivado-manager",
+            "sha256": sha256_file(args.utilization),
+            "note": "raw diagnostic context only",
         }
-
     text = json.dumps(report, indent=2, ensure_ascii=False)
     if args.out:
-        args.out.resolve().parent.mkdir(parents=True, exist_ok=True)
-        args.out.resolve().write_text(text, encoding="utf-8")
-
-    print(f"validity predicate: {provenance}")
-    print(f"{'layer':22} {'kind':9} {'rf':>5} {'valid':>6} {'MACs':>7} {'mult now':>9}  recommended")
-    for row in ranked:
-        if "predicted_multipliers_now" not in row:
-            continue
-        print(f"{row['layer']:22} {row['kind']:9} {row['factor_effective']:>5} "
-              f"{str(row['factor_now_is_valid']):>6} {row['multiplier_inputs']['macs']:>7} "
-              f"{row['predicted_multipliers_now']:>9}  {row.get('recommended_factor')}")
-    if top:
-        rec = report.get("recommendation")
-        print()
-        print(f"area-dominating layer: {top['layer']}")
-        if rec:
-            print(f"  factor {rec['factor_now']} -> {rec['factor_proposed']}: "
-                  f"predicted multipliers {rec['predicted_multipliers_now']} -> "
-                  f"{rec['predicted_multipliers_after']}")
-            print(f"  layer_reuse_factors: {json.dumps(rec['layer_reuse_factors'])}")
-    print()
-    print(report["prediction_caveat"])
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        with args.out.open("x", encoding="utf-8") as handle:
+            handle.write(text)
+    print(text)
     return 0
 
 

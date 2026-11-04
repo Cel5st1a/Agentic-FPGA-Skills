@@ -10,7 +10,7 @@ Two kinds of case:
   quotes in its cost-model table against what the runs actually produced.
 
 Run:
-    pytest C:/Users/Administrator/Agentic_FPGA_Deployment_skills/reuse-factor-resource-tuning/scripts/test_tune_reuse_factor.py
+    pytest reuse-factor-resource-tuning/scripts/test_tune_reuse_factor.py
 """
 
 from __future__ import annotations
@@ -55,7 +55,8 @@ struct config3_mult : nnet::dense_config {
     static const unsigned n_out = 8;
     static const unsigned reuse_factor = 5;
     static const unsigned n_zeros = 0;
-    static const unsigned multiplier_limit = DIV_ROUNDUP(n_in * n_out, reuse_factor) - n_zeros / reuse_factor;
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_in * n_out, reuse_factor) - n_zeros / reuse_factor;
     template<class data_T, class res_T, class CONFIG_T>
     using kernel = nnet::DenseResource_rf_leq_nin<data_T, res_T, CONFIG_T>;
 };
@@ -73,7 +74,8 @@ struct config6_mult : nnet::dense_config {
     static const unsigned n_out = 16;
     static const unsigned reuse_factor = 24;
     static const unsigned n_zeros = 0;
-    static const unsigned multiplier_limit = DIV_ROUNDUP(n_in * n_out, reuse_factor) - n_zeros / reuse_factor;
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_in * n_out, reuse_factor) - n_zeros / reuse_factor;
     template<class data_T, class res_T, class CONFIG_T>
     using kernel = nnet::DenseResource_rf_leq_nin<data_T, res_T, CONFIG_T>;
 };
@@ -91,7 +93,8 @@ struct config10 : nnet::dense_config {
     static const unsigned n_out = 4;
     static const unsigned reuse_factor = 1;
     static const unsigned n_zeros = 0;
-    static const unsigned multiplier_limit = DIV_ROUNDUP(n_in * n_out, reuse_factor) - n_zeros / reuse_factor;
+    static const unsigned multiplier_limit =
+        DIV_ROUNDUP(n_in * n_out, reuse_factor) - n_zeros / reuse_factor;
     template<class data_T, class res_T, class CONFIG_T>
     using kernel = nnet::DenseResource_rf_leq_nin<data_T, res_T, CONFIG_T>;
 };
@@ -147,13 +150,13 @@ def test_conv_records_the_factor_its_kernel_uses(parsed):
 @pytest.mark.parametrize(
     "n_in,n_out,rf,expected",
     [
-        (64, 64, 64, 64),    # mlp enc_dense_0
-        (64, 32, 64, 32),    # mlp enc_dense_1
-        (32, 4, 64, 2),      # mlp latent -- rf > n_in, still /rf
-        (5, 8, 5, 8),        # conv_0
-        (24, 16, 24, 16),    # conv_1
-        (256, 4, 2, 512),    # latent, the rejected intermediate
-        (256, 4, 256, 4),    # latent, the shipped factor
+        (64, 64, 64, 64),  # mlp enc_dense_0
+        (64, 32, 64, 32),  # mlp enc_dense_1
+        (32, 4, 64, 2),  # mlp latent -- rf > n_in, still /rf
+        (5, 8, 5, 8),  # conv_0
+        (24, 16, 24, 16),  # conv_1
+        (256, 4, 2, 512),  # latent, the rejected intermediate
+        (256, 4, 256, 4),  # latent, the shipped factor
     ],
 )
 def test_cost_model_matches_measured_rtl(n_in, n_out, rf, expected):
@@ -220,10 +223,15 @@ def test_inherited_factor_is_flagged(tmp_path):
 
     argv = sys.argv
     try:
-        sys.argv = ["tune_reuse_factor.py",
-                    "--deployment", str(contract),
-                    "--parameters", str(params),
-                    "--out", str(out)]
+        sys.argv = [
+            "tune_reuse_factor.py",
+            "--deployment",
+            str(contract),
+            "--parameters",
+            str(params),
+            "--out",
+            str(out),
+        ]
         assert tr.main() == 0
     finally:
         sys.argv = argv
@@ -232,14 +240,13 @@ def test_inherited_factor_is_flagged(tmp_path):
     by_layer = {row["layer"]: row for row in report["layers"]}
     assert by_layer["latent"]["factor_inherited_from_global"] is True
     assert by_layer["encoder_conv_0"].get("factor_inherited_from_global") is None
-    # The Dense layer dominates, and the recommendation must reach the target rather than
-    # settle for the smallest increase (rf=2 is measured insufficient).
-    assert report["area_dominating_layer"] == "latent"
-    rec = report["recommendation"]
-    assert rec["factor_proposed"] == 256
-    assert rec["layer_reuse_factors"]["latent"] == 256
-    # And it must never propose touching the global factor.
-    assert "reuse_factor" not in rec["layer_reuse_factors"]
+    # Historical RF256 is a tradeoff, not a universal area/latency optimum.
+    latent = by_layer["latent"]
+    assert latent["recommended_factor"] is None
+    estimates = {r["reuse_factor"]: r for r in latent["candidates"]}
+    assert estimates[256]["predicted_multipliers"] == 4
+    assert estimates[1024]["predicted_multipliers"] == 1
+    assert all(r["measured_latency_cycles"] is None for r in estimates.values())
 
 
 def test_report_never_proposes_lowering_the_global_factor(tmp_path):
@@ -253,8 +260,15 @@ def test_report_never_proposes_lowering_the_global_factor(tmp_path):
 
     argv = sys.argv
     try:
-        sys.argv = ["tune_reuse_factor.py", "--deployment", str(contract),
-                    "--parameters", str(params), "--out", str(out)]
+        sys.argv = [
+            "tune_reuse_factor.py",
+            "--deployment",
+            str(contract),
+            "--parameters",
+            str(params),
+            "--out",
+            str(out),
+        ]
         tr.main()
     finally:
         sys.argv = argv
@@ -275,14 +289,20 @@ def test_report_never_proposes_lowering_the_global_factor(tmp_path):
 REAL = {
     "asymmetric_cnn_fc/cnn04 (blocked: latent inherits global rf=1)": (
         Path(r"D:\ML_models\_line\runs\asymmetric_cnn_fc\20260928-cnn04"),
-        Path(r"D:\ML_models\_line\runs\asymmetric_cnn_fc\20260928-cnn04"
-             r"\contract\asymmetric_cnn_fc\deployment.yaml"),
-        "asymmetric_cnn_fc"),
+        Path(
+            r"D:\ML_models\_line\runs\asymmetric_cnn_fc\20260928-cnn04"
+            r"\contract\asymmetric_cnn_fc\deployment.yaml"
+        ),
+        "asymmetric_cnn_fc",
+    ),
     "mlp_64_32/mlp02 (delivered, global rf=64)": (
         Path(r"D:\ML_models\_line\runs\mlp_64_32\20260928-mlp02"),
-        Path(r"D:\ML_models\_line\runs\mlp_64_32\20260928-mlp02"
-             r"\contract\mlp_64_32\deployment.yaml"),
-        "mlp_64_32"),
+        Path(
+            r"D:\ML_models\_line\runs\mlp_64_32\20260928-mlp02"
+            r"\contract\mlp_64_32\deployment.yaml"
+        ),
+        "mlp_64_32",
+    ),
 }
 
 

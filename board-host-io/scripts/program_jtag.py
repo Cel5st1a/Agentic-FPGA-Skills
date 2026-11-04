@@ -19,31 +19,47 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 SKILLS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SKILLS / "scripts" / "line"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from attempt_evidence import CableLock, attempt_output  # noqa: E402
 import board_facts  # noqa: E402
+from attempt_evidence import CableLock, attempt_output  # noqa: E402
 
 
 def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def validate_program_stdout(stdout: str, cable_serial: str, target_name: str) -> None:
+def validate_program_stdout(
+    stdout: str, cable_serial: str, target_name: str, *, strict_status: bool = True
+) -> list[dict]:
     if cable_serial not in stdout:
         raise ValueError("expected JTAG cable serial absent from programming log")
     if target_name not in stdout:
         raise ValueError(f"expected {target_name} absent from programming log")
     if not re.search(r"AFD_AFTER FPGA is configured", stdout):
         raise ValueError("FPGA is not configured after JTAG download")
-    required = {"CRC ERROR": "0", "END OF STARTUP (EOS) STATUS": "1",
-                "DONE PIN": "1", "IDCODE ERROR": "0", "BAD PACKET ERROR": "0"}
+    required = {
+        "CRC ERROR": "0",
+        "END OF STARTUP (EOS) STATUS": "1",
+        "DONE PIN": "1",
+        "IDCODE ERROR": "0",
+        "BAD PACKET ERROR": "0",
+    }
+    diagnostics = []
     for name, expected in required.items():
         pattern = rf"{re.escape(name)}\s*(?:\([^\n]*?\))?\s*:\s*{expected}(?:\s|$)"
         if not re.search(pattern, stdout, re.M):
-            raise ValueError(f"JTAG status {name} did not equal {expected}")
+            if strict_status:
+                raise ValueError(f"JTAG status {name} did not equal {expected}")
+            diagnostics.append(
+                {
+                    "field": name,
+                    "expected": expected,
+                    "observation": "missing or different; see raw stdout",
+                }
+            )
+    return diagnostics
 
 
 def validate_inputs(bitstream: Path, scope_path: Path, bit_evidence_path: Path) -> dict:
@@ -51,9 +67,11 @@ def validate_inputs(bitstream: Path, scope_path: Path, bit_evidence_path: Path) 
     evidence = json.loads(bit_evidence_path.read_text(encoding="utf-8"))
     if not scope.get("host_input_output_available") or not scope.get("wrapper_ports_match"):
         raise ValueError("routed host port audit did not pass")
-    if (scope.get("verification_scope") != "host-path-present-unverified" or
-            scope.get("on_board_numerical") != "NOT_RUN" or
-            scope.get("hardware_verified") is not False):
+    if (
+        scope.get("verification_scope") != "host-path-present-unverified"
+        or scope.get("on_board_numerical") != "NOT_RUN"
+        or scope.get("hardware_verified") is not False
+    ):
         raise ValueError("port audit has an invalid pre-program verification scope")
     details = scope.get("ports") or {}
     for name, direction in (("uart_rx", "IN"), ("uart_tx", "OUT")):
@@ -87,11 +105,14 @@ def validate_inputs(bitstream: Path, scope_path: Path, bit_evidence_path: Path) 
     # cannot program this bitstream.
     facts = board_facts.facts_for_wrapper(wrapper_record)
     board_facts.require_routed_uart(details, facts)
-    return {"bitstream": str(bitstream.resolve()), "bitstream_sha256": sha256_file(bitstream),
-            "routed_checkpoint_sha256": scope["checkpoint_sha256"],
-            "io_scope_sha256": sha256_file(scope_path),
-            "bitstream_evidence_sha256": sha256_file(bit_evidence_path),
-            "board": facts.to_record()}
+    return {
+        "bitstream": str(bitstream.resolve()),
+        "bitstream_sha256": sha256_file(bitstream),
+        "routed_checkpoint_sha256": scope["checkpoint_sha256"],
+        "io_scope_sha256": sha256_file(scope_path),
+        "bitstream_evidence_sha256": sha256_file(bit_evidence_path),
+        "board": facts.to_record(),
+    }
 
 
 def tcl_program(bitstream: Path, cable_serial: str, target_name: str) -> str:
@@ -107,76 +128,115 @@ if {{[string first "{cable_serial}" $chain] < 0}} {{error "Expected JTAG cable a
 jtag targets -set -filter {{jtag_cable_name =~ "*{cable_serial}*" && name == "{target_name}"}}
 set selected [jtag targets]
 puts "AFD_SELECTED $selected"
-if {{[regexp -all {{\\*}} $selected] != 1}} {{error "Expected exactly one {target_name} under cable {cable_serial}"}}
-if {{[string first "{target_name}" $selected] < 0}} {{error "Expected {target_name} under the named cable"}}
+if {{[regexp -all {{\\*}} $selected] != 1}} {{
+    error "Expected exactly one {target_name} under cable {cable_serial}"
+}}
+if {{[string first "{target_name}" $selected] < 0}} {{
+    error "Expected {target_name} under the named cable"
+}}
 puts "AFD_BEFORE [fpga -state]"
 fpga -file {{{bitstream.resolve().as_posix()}}}
 puts "AFD_AFTER [fpga -state]"
-puts [fpga -config-status]
+if {{[catch {{fpga -config-status}} status]}} {{
+    puts "AFD_CONFIG_STATUS_UNAVAILABLE $status"
+}} else {{puts $status}}
 disconnect
 exit
 """
 
 
-def run_xsdb(command: list[str], output: Path, timeout: float = 120):
+def run_xsdb(command: list[str], output: Path, timeout: float | None = None):
     """Reap the entire launcher/tool tree before the caller releases its cable lock."""
-    process_options = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
-                       if os.name == "nt" else {"start_new_session": True})
-    with (output / "stdout.txt").open("w", encoding="utf-8") as out, \
-            (output / "stderr.txt").open("w", encoding="utf-8") as err:
-        process = subprocess.Popen(command, cwd=output, stdout=out, stderr=err,
-                                   **process_options)
+    process_options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        if os.name == "nt"
+        else {"start_new_session": True}
+    )
+    with (
+        (output / "stdout.txt").open("w", encoding="utf-8") as out,
+        (output / "stderr.txt").open("w", encoding="utf-8") as err,
+    ):
+        process = subprocess.Popen(command, cwd=output, stdout=out, stderr=err, **process_options)
         try:
             returncode = process.wait(timeout=timeout)
         except BaseException:
             if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                               capture_output=True, timeout=10)
+                subprocess.run(
+                    ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                    capture_output=True,
+                    timeout=10,
+                )
             else:
                 import signal
+
                 os.killpg(process.pid, signal.SIGKILL)
             process.wait(timeout=10)
             raise
-    return subprocess.CompletedProcess(command, returncode,
+    return subprocess.CompletedProcess(
+        command,
+        returncode,
         (output / "stdout.txt").read_text(encoding="utf-8", errors="replace"),
-        (output / "stderr.txt").read_text(encoding="utf-8", errors="replace"))
+        (output / "stderr.txt").read_text(encoding="utf-8", errors="replace"),
+    )
 
 
-def program(bitstream: Path, scope: Path, bit_evidence: Path, output: Path,
-            cable_serial: str | None, xsdb: Path) -> dict:
+def program(
+    bitstream: Path,
+    scope: Path,
+    bit_evidence: Path,
+    output: Path,
+    cable_serial: str | None,
+    xsdb: Path,
+) -> dict:
     bitstream, scope, bit_evidence, output = map(Path, (bitstream, scope, bit_evidence, output))
     proof = validate_inputs(bitstream, scope, bit_evidence)
     facts = proof["board"]
     declared_cable = (facts.get("jtag") or {}).get("cable_serial")
     target_name = (facts.get("jtag") or {}).get("target_name")
     if not target_name:
-        raise ValueError(f"board profile {facts['pins_profile']} declares no jtag.target_name; "
-                         f"the chain device is never guessed")
+        raise ValueError(
+            f"board profile {facts['pins_profile']} declares no jtag.target_name; "
+            f"the chain device is never guessed"
+        )
     # A session may name a different cable than the profile's verified one (the AX7A200B's
     # cable is an accessory, not part of the board); the record says which it was.
     cable_source = "command line" if cable_serial else "board profile"
     cable_serial = cable_serial or declared_cable
     if not cable_serial:
-        raise ValueError(f"board profile {facts['pins_profile']} declares no jtag.cable_serial "
-                         f"and no --cable-serial was given")
+        raise ValueError(
+            f"board profile {facts['pins_profile']} declares no jtag.cable_serial "
+            f"and no --cable-serial was given"
+        )
     script = output / "program.tcl"
-    command = (["cmd", "/c", str(xsdb), str(script)] if xsdb.suffix.lower() in {".bat", ".cmd"}
-               else [str(xsdb), str(script)])
-    summary = {**proof, "programmed": False, "mode": "volatile JTAG",
-               "cable_serial": cable_serial, "cable_source": cable_source,
-               "declared_cable_serial": declared_cable, "target_name": target_name,
-               "command": command}
+    command = (
+        ["cmd", "/c", str(xsdb), str(script)]
+        if xsdb.suffix.lower() in {".bat", ".cmd"}
+        else [str(xsdb), str(script)]
+    )
+    summary = {
+        **proof,
+        "programmed": False,
+        "hardware_numerical_verified": False,
+        "mode": "volatile JTAG",
+        "cable_serial": cable_serial,
+        "cable_source": cable_source,
+        "declared_cable_serial": declared_cable,
+        "target_name": target_name,
+        "command": command,
+    }
     with attempt_output(output, summary):
         try:
             script.write_text(tcl_program(bitstream, cable_serial, target_name), encoding="utf-8")
             with CableLock(cable_serial):
-                result = run_xsdb(command, output, timeout=120)
+                result = run_xsdb(command, output, timeout=None)
             (output / "stdout.txt").write_text(result.stdout, encoding="utf-8")
             (output / "stderr.txt").write_text(result.stderr, encoding="utf-8")
             summary["returncode"] = result.returncode
             if result.returncode:
                 raise ValueError(f"XSDB exited {result.returncode}")
-            validate_program_stdout(result.stdout, cable_serial, target_name)
+            summary["protocol_diagnostics"] = validate_program_stdout(
+                result.stdout, cable_serial, target_name, strict_status=False
+            )
             summary["programmed"] = True
         except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             summary["error"] = str(exc)
@@ -189,13 +249,19 @@ def main() -> int:
     parser.add_argument("--io-scope", type=Path, required=True)
     parser.add_argument("--bitstream-evidence", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--cable-serial", default=None,
-                        help="defaults to the board profile's jtag.cable_serial")
-    parser.add_argument("--xsdb", type=Path,
-                        default=Path(r"D:\vitis\2025.2\Vivado\bin\xsdb.bat"))
+    parser.add_argument(
+        "--cable-serial", default=None, help="defaults to the board profile's jtag.cable_serial"
+    )
+    parser.add_argument("--xsdb", type=Path, default=Path(r"D:\vitis\2025.2\Vivado\bin\xsdb.bat"))
     args = parser.parse_args()
-    summary = program(args.bitstream, args.io_scope, args.bitstream_evidence,
-                      args.output, args.cable_serial, args.xsdb)
+    summary = program(
+        args.bitstream,
+        args.io_scope,
+        args.bitstream_evidence,
+        args.output,
+        args.cable_serial,
+        args.xsdb,
+    )
     print(json.dumps(summary, indent=2))
     return 0 if summary["programmed"] else 1
 

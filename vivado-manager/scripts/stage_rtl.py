@@ -23,8 +23,13 @@ Staging rules
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from line.identity import capture_reuse_identity, compare_reuse_identity  # noqa: E402
 
 CORE_PATTERNS = ("*.v", "*.sv", "*.dat", "*.mem", "*.hex")
 WRAPPER_PATTERNS = ("board_top*.v", "board.xdc")
@@ -44,13 +49,64 @@ def _same_file(left: Path, right: Path) -> bool:
     return sha256_file(left) == sha256_file(right)
 
 
+def core_sources(core: Path) -> dict[str, str]:
+    """Snapshot exactly the flat core bundle consumed by this staging rule."""
+    core = Path(core)
+    if not core.is_file():
+        raise FileNotFoundError(f"generated core not found: {core}")
+    return {
+        p.name: sha256_file(p)
+        for pattern in CORE_PATTERNS
+        for p in sorted(core.parent.glob(pattern))
+        if p.is_file()
+    }
+
+
+def dependency_delta(previous: dict, current: dict) -> dict:
+    """RTL-only change scope, never automatic reuse or model/hardware qualification."""
+    before, after = previous.get("dependency_scopes"), current.get("dependency_scopes")
+    if not before or not after:
+        return {
+            "staged_core_content_unchanged": None,
+            "affected_stages": None,
+            "reuse_identity_comparison": compare_reuse_identity(
+                previous.get("reuse_identity"), current.get("reuse_identity")
+            ),
+        }
+    unchanged = before["core"] == after["core"]
+    downstream = ["board_simulation", "synth", "impl", "bitstream", "board_capture"]
+    affected = (
+        ["core_simulation", *downstream]
+        if not unchanged
+        else downstream
+        if before["wrapper"] != after["wrapper"]
+        else []
+    )
+    return {
+        "staged_core_content_unchanged": unchanged,
+        "affected_stages": affected,
+        "scope": "RTL content only; model/config/tool identity not evaluated",
+        "hardware_verified": False,
+        "reuse_identity_comparison": compare_reuse_identity(
+            previous.get("reuse_identity"), current.get("reuse_identity")
+        ),
+    }
+
+
 def stage_rtl(board: Path, wrapper: dict) -> dict:
     core = Path(wrapper["core_verilog"])
     if not core.is_file():
         raise SystemExit(f"generated core not found: {core}")
     board = board.resolve()
     rtl_dir = board / "rtl"
-    rtl_dir.mkdir(parents=True, exist_ok=True)
+
+    current_core = core_sources(core)
+    recorded = wrapper.get("core_source_manifest")
+    if recorded is not None and (not isinstance(recorded, dict) or recorded != current_core):
+        raise ValueError(
+            "core source manifest differs: missing, added or modified source; "
+            "preserve the old attempt and regenerate its dependency record"
+        )
 
     sources: list[Path] = []
     for pattern in CORE_PATTERNS:
@@ -63,12 +119,42 @@ def stage_rtl(board: Path, wrapper: dict) -> dict:
             raise SystemExit(f"invalid extra RTL source: {relative}")
         sources.append(source)
     if not sources:
-        raise SystemExit(f"nothing to stage: no RTL next to {core} and no wrapper output in {board}")
+        raise SystemExit(
+            f"nothing to stage: no RTL next to {core} and no wrapper output in {board}"
+        )
 
-    expected = {source.name for source in sources}
+    unique = {}
+    for source in sources:
+        key = os.path.normcase(source.name)
+        if key in unique and unique[key].resolve() != source.resolve():
+            raise ValueError(f"colliding RTL source name: {source.name}")
+        unique[key] = source
+    sources = list(unique.values())
+    reuse = None
+    if "reuse_inputs" in wrapper:
+        request = wrapper["reuse_inputs"]
+        try:
+            reuse = capture_reuse_identity(
+                wrapper["contract"],
+                arithmetic_config=request.get("arithmetic_config"),
+                tool_versions=request.get("tool_versions"),
+                arithmetic_files=request.get("arithmetic_files"),
+                core_files={p.name: p for p in sources if p.name in current_core},
+                wrapper_files={p.name: p for p in sources if p.name not in current_core},
+            )
+        except (AttributeError, KeyError, TypeError, ValueError, OSError) as error:
+            reuse = {
+                "schema_version": 1,
+                "kind": "reuse_identity",
+                "fingerprints": {},
+                "missing": {"core": [str(error)], "wrapper": [str(error)]},
+                "hardware_verified": False,
+            }
+    expected = set(unique)
+    rtl_dir.mkdir(parents=True, exist_ok=True)
     removed = []
     for stale in sorted(rtl_dir.iterdir()):
-        if stale.is_file() and stale.name not in expected:
+        if stale.is_file() and os.path.normcase(stale.name) not in expected:
             stale.unlink()
             removed.append(stale.name)
 
@@ -88,4 +174,12 @@ def stage_rtl(board: Path, wrapper: dict) -> dict:
         "files": staged,
         "copied": copied,
         "removed_stale": removed,
+        "core_manifest_verification": "VERIFIED_CONTENT"
+        if recorded is not None
+        else "UNRECORDED_LEGACY",
+        "dependency_scopes": {
+            "core": current_core,
+            "wrapper": {p.name: staged[p.name] for p in sources if p.name not in current_core},
+        },
+        "reuse_identity": reuse,
     }

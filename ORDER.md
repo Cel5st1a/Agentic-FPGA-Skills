@@ -1,8 +1,46 @@
 # FPGA 模型 → bitstream 与板级验证技能链
 
-本目录是这条技能链的唯一工作副本。**任何 skill 改动都只在这里进行。**
+本独立版本为 S15-opt4，继承 opt3 工具。新增工具和范围见 [opt3 使用说明](docs/opt3-tools.md)。
+宽流式数据移动采用固定移位；输入寄存器增加，不预先保证LUT/FF/布线收益。
+QKeras主机诊断保留原量化器；表/并行度摘要只描述生成源码，不决定可部署性。
+阶段续作只克隆同组已验证身份的前阶段checkpoint至新目录，未知身份不默认可复用。
+这些能力不要求逐项调用，不授权重跑已关闭实验，也不改变下述唯一板端数值验收。
+
+S15-opt 内容身份快照：`scripts/line/identity.py --capture <request.json> --output <new.json>`；
+比较：`--compare <previous.json> <current.json> --output <new-report.json>`。
+快照读取实际模型/关联权重、算术文件/有效配置、明确提供的工具版本、核心与包装依赖。
+文件路径仅溯源，同内容迁移不使核心失效；缺文件/未知版本返回 null。身份匹配只是必要条件，
+不鉴证历史数值有效性，不自动复制工件或跳过执行，不新增验收门槛。仅列出的算术文件在范围内，
+清单完整性仍需对照产生阶段；不能把历史 bit 存在或 exit0 当可复用证明。
+`stage_rtl.dependency_delta.affected_stages` 保留原 RTL 内容范围；跨模型/配置/工具的判断须读取
+`reuse_identity_comparison`，不能只看外层列表决定复用。旧记录无身份信息时是未知，仍可正常构建。
+
+本目录是独立 S15-opt 修复副本。原技能、实验冻结输入和历史结果保持不变。
+
+## S15-opt 当前任务规则（优先于下文历史工作流）
+
+- 用户只给原模型、权重与公共输入；本任务要求完整模型真实上板，256 条完整输出满足 `abs(error)<=.001+.001*abs(ref)`。不裁剪 Sigmoid/Softmax，不用答案替代硬件结果。
+- 资源比例、预选时钟、时序报告、HLS 对照、cosim、协议诊断和打包完备度不增加验收门槛。真实厂商错误、无法生成或部署的实现仍是实际失败；电气和精确板卡要求保留。
+- `verify_board.py` 的 Python 对照决定数值结论，HLS 对照可缺省并单列。必须同时保留真实串口采集、原模型身份、下载来源等执行证据；直接调用纯比较函数并不证明上板。
+- 构建或采集失败时定位最小缺项，保留有效核心和每个尝试。成功后停止部署；不得为旧打包器或报告的额外条件重跑。
+- 下文旧阈值和固定阶段流程仅是兼容资料。`run_line.py` 与旧 packager 仍是历史确定性构建/审计入口，不是 S15-opt 自主任务必须逐项执行的验收关卡。
+- `softmax_exp_read_factor` 是组内可选择的生成调度项，仅在已识别的模板上修改表读取 pragma。保持完整指数、求和、归一化；缺省不改调度，不固定历史模型的 RF、精度或表深度。
+- 先看转换证据的 `parameter_grid_diagnostics` 和实际偏差，再分别调整权重、累加和非线性。小于 LSB 不等于已被量化为零；舍入模式、资源和数值收益需要测量。
+- `local_precision_search.py --role weight|bias|result|accum|table|exp_table|inv_table|inv_inp --trace-layers` 可显式执行单层单角色主机C++候选。追踪只比较有对应Keras边界的层输出，融合后无法对应的层保持未知；最早观察到偏差的层不是已证明的根因，不代表内部累加轨迹。先跑基线，满足容差即停止；不自动改原契约或替代板测。
+- 无默认墙钟或调用次数上限；长时间安静不代表卡死。只按实际进程和日志事实诊断。硬件授权与当前状态以用户和campaign账本为准；本opt3开发副本不授权访问硬件，不得替换任何正在运行的冻结臂。
 
 开始或恢复部署前读 [转换与上板恢复规则](docs/deployment-recovery.md)：核对配置及结构改动实际生效、区分模型与接口包装成本、保存真实阶段状态，并以同一 run 的完整证据验收代理完成状态。监控策略取当前任务授权，实验策略不作为技能默认。
+
+模型结构选择先看 [跨前端效率路径](docs/efficiency-by-model-family.md)：Dense/Sigmoid、深层Dense/Softmax、QKeras、ONNX分支与Conv1D/2D分别诊断，不把某个模型的RF/位宽或修复套到其他模型。
+
+## opt2 最短有效路径（优先于下文历史阶段清单）
+
+- 目标是原模型完整数值上板通过；不以invoke数量或完整跑遍技能链作为效率成果。只读15技能不意味着应启动15套诊断。环境/板卡公开事实从本组输入读取，不重复安装、探查或重做已成立的同组准备。
+- 首先检查生成配置与原CPU输出。通过当前容差后不要为更接近零误差反复增加全局位宽、查表深度。失败时先定位输入/层/实际类型，调整最小相关角色；保持完整网络和权重。
+- 物理构建前先读实际生成Strategy/kernel及RF；RF大不等于共享生效。Conv2D几何和mult配置由RF工具读取。已有综合报告优先用于定位LUT/FF/BRAM/DSP映射，不为凑诊断加一次EDA。
+- 长布线先看日志及所属PID+birth/CPU，不设置墙钟上限。自主候选改变需说明假设和预期映射差异；只改壳保留有效核，只改物理策略保留适用综合结果。无身份/失败工件不能自动复用。
+- 用log-analyzer的Python效率摘要读取已有记录；原始日志保留，prompt只提取决策所需片段。不能把RF算术估计、HLS周期、UART整批时间或缓存命中token当成物理性能/实际账单。
+- 完整板端数值已通过就停止部署，后续总结离线完成。只给简单一行TASK也应能找到本节；不需要用户提供精度/RF/历史实现或私有参考。
 
 ## 一、阶段顺序（P1 → P5）
 
@@ -23,7 +61,7 @@
 | P5 | `workflow-memory` | 记录成功/失败组合 | `workflow-memory/examples/*.json` |
 | P5 | `zynq-deploy` | Zynq 部署背景材料（本 Artix-7 路径不调用） | 无 |
 
-## 二、判定标准（冻结，任何 skill 不得放宽）
+## 二、历史判定标准（兼容记录，不适用于本次用户验收）
 
 逐值判定：
 
@@ -90,7 +128,7 @@ agent 的职责是读字段、核对来源与门禁；遇到缺字段或未知�
 | 输出元素数、顺序 | 新记录 `output_layout.elements/flatten` | AXIS 核对 `interface.stream.output_elements`；ap_vld 核对有序标量端口映射 |
 | 输入网格 | `rom_image.grid` | 与契约 precision、AXIS `element_types.input` 相等 |
 | 输出网格 | `output_grid` | 与契约 precision、AXIS `element_types.output` 相等；ap_vld 核对每个输出端口位宽 |
-| lane、拍数、TDATA | `interface.stream` | 输入拍数 = 输入元素数 / 输入 lane 数且整除；输出单拍；lane 位宽等于元素位宽；实际 TDATA 整字节 |
+| lane、拍数、TDATA | `interface.stream` | 输入/输出拍数分别 = 对应元素数 / 对应 lane 数且整除；整拍多输出拍按窗口聚合；lane 位宽等于元素位宽；实际 TDATA 整字节 |
 | UART 载荷、总线、帧长、scale、波特率 | 主机生成时保存的 `host_geometry` | 消费时检查字段关系及 `host_protocol` 投影；禁止用新推导值替换记录 |
 
 旧记录仅允许两条明确的输出计数规则：AXIS 读取已有 `stream.output_elements`；
@@ -190,3 +228,8 @@ P3 的 `reuse-factor-resource-tuning` 同样是**单独调用**的咨询步骤�
 
 板卡身份是组合记录：`contract_sha256` 只标识 deployment.yaml；`board_profile_sha256` 标识它引用的板卡文件，
 `board_pins_profile_sha256` 标识实际引脚 profile。不可只用第一项认板卡；新 run 的开局、运行计划和阶段证据都保留这些字段。
+
+## Opt4 数值偏差定位
+当原 Python 与 CSim 接近而 RTL/板端有明显偏差时，先复用现有日志和工程，比较首个计算层、池化边界及输出前张量，定位第一个不一致的边界，再修改对应实现。连续候选产生相同错误值时停止盲目扫描 RF、位宽或非线性表。RTL/CSim 均属定位手段，用户验收仍是完整原模型真实板端输出的原 Python 数值比较。
+Vitis/hls4ml 1.3.0 的生成工程自动加入按结构选择的显式池化兼容实现。仅 2x2/stride2、无填充、一个像素的全部通道占一个数据包的 MaxPooling2D 使用该路径，其他形状保留原实现。修改记录进入转换证据。
+采集样本数从 verification.samples 读取，未声明时沿用 256。必须与实际输入条数一致，不能重复输入凑样本数。

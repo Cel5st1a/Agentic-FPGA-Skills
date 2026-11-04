@@ -12,6 +12,21 @@ allowed-tools: Bash, Read, Grep, Glob, WebSearch
 
 # FPGA Environment Audit
 
+## opt2-wide: reuse established environment facts within this attempt
+
+Read ORDER.md and the current campaign authorization first. Read an existing same-run
+report and recorded executable/runtime identities before launching another broad audit.
+Conversion/precision/RF changes alone do not imply the installed Python/EDA runtime changed.
+If executable path/content/version, dependencies or permission boundary changed, refresh
+only the affected checks and record the difference. Missing evidence remains unknown.
+Do not reinstall/downgrade shared TensorFlow/QKeras/EDA tools to silence a warning, and do
+not repeatedly discover alternative SDKs while a supported current runtime is working.
+Any genuine environment repair must respect frozen-run restrictions and preserve failure
+records. Environment evidence is not current board liveness or board numerical success:
+use the actual authorized cable/part and complete original-model outputs for those claims.
+This is advice, not an automatic cache skip or a new acceptance gate.
+
+
 ## Purpose
 Audit the complete FPGA+AI development environment in a single pass. Detect
 version conflicts, missing dependencies, path pollution, duplicate installs,

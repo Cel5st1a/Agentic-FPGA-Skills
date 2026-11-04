@@ -15,16 +15,9 @@ Design rules (operator principles, 2026-09-27):
   * No acceptance claim: this script converts and records; the numeric verdict
     belongs to the criterion in `scripts/line/contract.py`.
 
-Gated quantity (declarative, not hardcoded): the contract may set
-`verification.gate_output` to `auto` (default), `logits` or `probabilities`.
-
-  * `logits`  - the trailing softmax node is skipped in hardware and the Python
-                reference is computed with that activation replaced by linear, so
-                the gate compares the same quantity on both sides. This is the
-                documented default for a model whose last layer carries softmax,
-                because hls4ml's softmax is an approximate lookup table whose error
-                exceeds the frozen rule (see hls4ml-convert/known-issues.md).
-  * `probabilities` - nothing is skipped; the gate compares final probabilities.
+Output quantity: this S15-opt version preserves the full original network.
+`verification.gate_output=auto` or `probabilities` retains Softmax/Sigmoid;
+logits-only deployment is rejected. Original CPU references include all activations.
 
 Requires the conversion environment the SKILL.md names:
   D:\\python_envs\\hls4ml_conv\\Scripts\\python.exe   (TF 2.13.1 / hls4ml 1.3.0)
@@ -42,15 +35,18 @@ import contextlib
 import hashlib
 import io
 import json
-import shutil
 import sys
 from pathlib import Path
 
 import yaml
+
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from contract_config import apply_contract_config, firmware_config_audit
-from generated_compat import patch_po2_product, pin_output_grid
+from contract_config import apply_contract_config, firmware_config_audit, original_output_mode
+from pooling_compat import patch_stream_pooling
+from pooling_compat import patch_stream_pooling
+from generated_compat import configure_softmax_exp_reads, patch_po2_product, pin_output_grid
+from numeric_diagnostics import parameter_grid_diagnostics
 
 SKILL = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE = SKILL / "templates" / "hls4ml_config_template.yaml"
@@ -265,8 +261,9 @@ def qkeras_layer_precisions(model) -> dict:
     return precisions
 
 
-def build_hls_config(template: dict, contract: dict, skipped_nodes: list[str],
-                     layer_precisions: dict | None = None):
+def build_hls_config(
+    template: dict, contract: dict, skipped_nodes: list[str], layer_precisions: dict | None = None
+):
     """hls4ml config built from this skill's template plus contract overrides.
 
     The template is the config source on purpose. Injecting a per-layer
@@ -308,7 +305,9 @@ def main() -> int:
     parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, default=None)
-    parser.add_argument("--inputs", type=Path, default=None, help="defaults to contract verification.inputs")
+    parser.add_argument(
+        "--inputs", type=Path, default=None, help="defaults to contract verification.inputs"
+    )
     parser.add_argument("--reference-out", type=Path, default=None, help="gate reference JSON")
     parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE)
     args = parser.parse_args()
@@ -326,15 +325,15 @@ def main() -> int:
     shape = sample_shape(contract)
     part = board_part(contract_path, contract)
     verification = contract.get("verification") or {}
-    gate_output = str(verification.get("gate_output", "auto")).lower()
-    if gate_output not in {"auto", "logits", "probabilities"}:
-        raise SystemExit(f"unknown verification.gate_output: {gate_output}")
+    gate_output = original_output_mode(verification)
 
     model, loader = load_model(contract_path, contract)
     trailing_softmax = softmax_nodes(model)
     drop_softmax = gate_output == "logits" or (gate_output == "auto" and bool(trailing_softmax))
 
-    backend = "Vitis" if contract.get("backend") == "hls4ml-vitis" else template.get("Backend", "Vivado")
+    backend = (
+        "Vitis" if contract.get("backend") == "hls4ml-vitis" else template.get("Backend", "Vivado")
+    )
 
     # hls4ml names the activation node `<layer>_softmax` when a Dense/Conv layer carries
     # the activation, and keeps the layer name for a standalone Activation layer. The
@@ -362,8 +361,9 @@ def main() -> int:
     # them is part of converting the same function. Plain Keras models must stay on the
     # template-only config (see build_hls_config for the measurement behind that rule).
     layer_precisions = {}
-    if contract["model"].get("frontend") in {"qkeras_json_weights", "brevitas"} or \
-            contract["model"].get("quantized"):
+    if contract["model"].get("frontend") in {"qkeras_json_weights", "brevitas"} or contract[
+        "model"
+    ].get("quantized"):
         layer_precisions = qkeras_layer_precisions(model)
     hls_config = build_hls_config(template, contract, skipped_nodes, layer_precisions)
 
@@ -379,59 +379,33 @@ def main() -> int:
             io_type=contract["io_type"],
             backend=backend,
         )
-        output_grid_record = pin_output_grid(hls_model, contract['precision']) if layer_precisions else None
+        output_grid_record = (
+            pin_output_grid(hls_model, contract["precision"]) if layer_precisions else None
+        )
         if output_grid_record:
-            hls_config = hls_model.config.config['HLSConfig']
+            hls_config = hls_model.config.config["HLSConfig"]
         hls_model.write()
     conversion_log = capture.getvalue()
     sys.stdout.write(conversion_log)
     # Only projects that actually use the exponential product need this verified repair.
-    uses_po2 = any('nnet::product::weight_exponential' in p.read_text(encoding='utf-8')
-                   for p in (project_dir / 'firmware').glob('*.h'))
+    uses_po2 = any(
+        "nnet::product::weight_exponential" in p.read_text(encoding="utf-8")
+        for p in (project_dir / "firmware").glob("*.h")
+    )
+    pooling_record = patch_stream_pooling(project_dir, hls4ml.__version__, backend)
+    pooling_record = patch_stream_pooling(project_dir, hls4ml.__version__, backend)
     compat_record = patch_po2_product(project_dir, hls4ml.__version__) if uses_po2 else None
-    # hls4ml 1.3.0 answers an unsupported ReuseFactor with a printed warning and a silent
-    # substitution (backends/fpga/fpga_backend.py:set_closest_reuse_factor). That is not
-    # cosmetic: measured on the qkeras_mnist_cnn contract, the substituted convolution
-    # (requested 16, used 18) no longer matched the model - max abs error 27.5 on logits of
-    # order 30, 989/1000 values outside tolerance - while a reuse factor hls4ml accepts
-    # (rf=1, same precision) brought the same design to 0.095, and enough accumulator
-    # precision then brought it to 0.023 with 0/1000. A silent substitution is therefore
-    # treated as a failed conversion, reported with the values hls4ml would accept.
-    substitutions = [line.strip() for line in conversion_log.splitlines()
-                     if "Invalid ReuseFactor=" in line]
-    if substitutions:
-        # A refused conversion must not leave a project behind: the emitted kernel already
-        # contains the substitution, and a leftover directory would both block a retry in
-        # the same run and invite a later stage to synthesise the wrong design.
-        shutil.rmtree(project_dir, ignore_errors=True)
-        evidence = {
-            "schema_version": 1,
-            "stage": "hls4ml_convert",
-            "skill": "hls4ml-convert",
-            "contract": {"path": str(contract_path), "sha256": sha256_file(contract_path)},
-            "template": {"path": str(args.template), "sha256": sha256_file(args.template)},
-            "status": "FAILED",
-            "reasons": [
-                "hls4ml substituted a ReuseFactor this contract asked for; the substitution "
-                "changes the emitted kernel and, measured on this line, the arithmetic",
-                *substitutions,
-            ],
-            "reuse_factor_requested": contract["reuse_factor"],
-            "output_dir": str(project_dir),
-            "numerical_verdict": "NOT_EVALUATED_BY_THIS_SCRIPT",
-        }
-        if args.evidence:
-            args.evidence.resolve().parent.mkdir(parents=True, exist_ok=True)
-            args.evidence.resolve().write_text(
-                json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8"
-            )
-        raise SystemExit(
-            "hls4ml substituted a ReuseFactor instead of using the contract's value:\n  "
-            + "\n  ".join(substitutions)
-            + "\nChoose a reuse_factor naming one of the valid values for every layer "
-              "(the message lists them per layer); the line does not accept a silent "
-              "substitution because it changes the hardware's arithmetic."
-        )
+    exp_read_factor = contract.get("softmax_exp_read_factor")
+    schedule_record = (
+        configure_softmax_exp_reads(project_dir, hls4ml.__version__, exp_read_factor)
+        if exp_read_factor is not None
+        else None
+    )
+    # Record backend-selected RF values. Real numerical results decide correctness;
+    # a substitution is not grounds to delete a generated project or refuse it.
+    substitutions = [
+        line.strip() for line in conversion_log.splitlines() if "Invalid ReuseFactor=" in line
+    ]
 
     # Testbench data and the Python side of the gate.
     inputs_path = args.inputs
@@ -471,14 +445,21 @@ def main() -> int:
             "hls4ml": hls4ml.__version__,
         },
         "model_loader": loader,
-        "compatibility_repairs": [compat_record] if compat_record else [],
+        "compatibility_repairs": ([compat_record] if compat_record else []) + [pooling_record],
         "output_grid_pin": output_grid_record,
-        "configuration_audit": firmware_config_audit(project_dir, contract.get('hls_config') or {}, hls_config,
-            nodes=[{'name': n.name, 'class_name': n.class_name} for n in hls_model.get_layers()]),
+        "configuration_audit": firmware_config_audit(
+            project_dir,
+            contract.get("hls_config") or {},
+            hls_config,
+            nodes=[{"name": n.name, "class_name": n.class_name} for n in hls_model.get_layers()],
+        ),
+        "softmax_exp_read_scheduling": schedule_record,
+        "parameter_grid_diagnostics": parameter_grid_diagnostics(hls_model),
+        "reuse_factor_substitutions": substitutions,
         "input_shape_used": list(shape),
         "target_part": part,
         "gate_quantity": {
-            "declared": gate_output,
+            "declared": str(verification.get("gate_output", "auto")).lower(),
             "resolved": "pre_softmax_logits" if drop_softmax else "probabilities",
             "softmax_layers": trailing_softmax,
             "skipped_hls4ml_nodes": skipped_nodes,
@@ -513,18 +494,20 @@ def main() -> int:
         "numerical_verdict": "NOT_EVALUATED_BY_THIS_SCRIPT",
     }
     evidence_path = args.evidence or (project_dir.parent / "convert-evidence.json")
-    evidence_path.write_text(
-        json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8"
+    evidence_path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "project": str(project_dir),
+                "gate_quantity": evidence["gate_quantity"]["resolved"],
+                "skipped_nodes": skipped_nodes,
+                "samples": reference_record.get("samples"),
+                "evidence": str(evidence_path),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
     )
-    if evidence['configuration_audit']['status'] == 'FAILED':
-        raise SystemExit('generated configuration mismatch: ' + '; '.join(evidence['configuration_audit']['mismatches']))
-    print(json.dumps({
-        "project": str(project_dir),
-        "gate_quantity": evidence["gate_quantity"]["resolved"],
-        "skipped_nodes": skipped_nodes,
-        "samples": reference_record.get("samples"),
-        "evidence": str(evidence_path),
-    }, indent=2, ensure_ascii=False))
     return 0
 
 

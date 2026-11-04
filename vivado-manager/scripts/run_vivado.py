@@ -1,14 +1,10 @@
 #!/usr/bin/env python
 """vivado-manager: run one Vivado stage of the board flow for a rendered wrapper.
 
-Stages: synth (project + synthesis), impl (opt/place/route + timing/DRC gate),
-bitstream (write the .bit from a checkpoint that still meets timing).
-
-Design rules (operator principles, 2026-09-27): the part, project name, source dir and
-constraints all come from the rendered wrapper/contract -- no board or model literal
-lives here; the resource gate is the contract's own `constraints.resource_fraction_max`,
-and a violation is reported as BLOCKED rather than as a failed tool run, so "the design
-does not fit the frozen budget" stays distinguishable from "the tool broke".
+Stages: synth, impl and bitstream. Part, sources and constraints come from the
+wrapper/contract. Resource percentage targets and timing are diagnostics; actual
+vendor failures and physical over-capacity are failures. No board acceptance is
+claimed here, even if the tool succeeds and produces a bitstream.
 """
 
 from __future__ import annotations
@@ -27,13 +23,19 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from stage_rtl import stage_rtl  # noqa: E402
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from line.identity import identity_fields  # noqa: E402
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
 DEFAULT_VIVADO = Path(r"D:\vitis\2025.2\Vivado\bin\vivado.bat")
-RESOURCE_KEYS = {"lut": "CLB LUTs", "ff": "CLB Registers", "bram_tile": "Block RAM Tile",
-                 "dsp": "DSPs", "carry4": "CARRY4"}
+RESOURCE_KEYS = {
+    "lut": "CLB LUTs",
+    "ff": "CLB Registers",
+    "bram_tile": "Block RAM Tile",
+    "dsp": "DSPs",
+    "carry4": "CARRY4",
+}
 #: Vivado 2025.2 labels the same rows "Slice LUTs" / "Slice Registers" in report_utilization.
 #: F8 Muxes is not gated; it is read because it supplies CARRY4's denominator (see
 #: parse_utilization).
@@ -72,8 +74,7 @@ def _kill_tree(pid: int) -> None:
     output straight to files and kills the whole tree on timeout.
     """
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True)
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
     else:  # pragma: no cover - the project's toolchain is Windows
         import signal
 
@@ -82,12 +83,16 @@ def _kill_tree(pid: int) -> None:
 
 def run_vivado(vivado: Path, script: Path, work: Path, timeout: int) -> dict:
     work.mkdir(parents=True, exist_ok=True)
-    argv = (["cmd", "/c", str(vivado)] if vivado.suffix.lower() in {".bat", ".cmd"} else [str(vivado)])
+    argv = (
+        ["cmd", "/c", str(vivado)] if vivado.suffix.lower() in {".bat", ".cmd"} else [str(vivado)]
+    )
     argv += ["-mode", "batch", "-source", str(script), "-nojournal", "-notrace"]
     stdout_path, stderr_path = work / "stdout.txt", work / "stderr.txt"
     started = time.monotonic()
-    with stdout_path.open("w", encoding="utf-8", errors="replace") as out, \
-            stderr_path.open("w", encoding="utf-8", errors="replace") as err:
+    with (
+        stdout_path.open("w", encoding="utf-8", errors="replace") as out,
+        stderr_path.open("w", encoding="utf-8", errors="replace") as err,
+    ):
         process = subprocess.Popen(argv, cwd=str(script.parent), stdout=out, stderr=err)
         try:
             returncode, timed_out = process.wait(timeout=timeout), False
@@ -99,12 +104,26 @@ def run_vivado(vivado: Path, script: Path, work: Path, timeout: int) -> dict:
             except subprocess.TimeoutExpired:
                 process.kill()
     duration = round(time.monotonic() - started, 2)
-    (work / "command.json").write_text(json.dumps(
-        {"argv": argv, "timeout_s": timeout, "returncode": returncode,
-         "timed_out": timed_out, "duration_s": duration}, indent=2), encoding="utf-8")
-    return {"argv": argv, "returncode": returncode, "timed_out": timed_out,
-            "duration_s": duration,
-            "stdout": stdout_path.read_text(encoding="utf-8", errors="replace")}
+    (work / "command.json").write_text(
+        json.dumps(
+            {
+                "argv": argv,
+                "timeout_s": timeout,
+                "returncode": returncode,
+                "timed_out": timed_out,
+                "duration_s": duration,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    return {
+        "argv": argv,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "duration_s": duration,
+        "stdout": stdout_path.read_text(encoding="utf-8", errors="replace"),
+    }
 
 
 def parse_utilization(path: Path) -> dict:
@@ -161,8 +180,11 @@ def parse_utilization(path: Path) -> dict:
             if not f8:
                 continue
             available = f8["available"] + f8.get("prohibited", 0.0)
-            rows["CARRY4"] = {"used": used, "available": available,
-                              "fraction": (used / available) if available else 0.0}
+            rows["CARRY4"] = {
+                "used": used,
+                "available": available,
+                "fraction": (used / available) if available else 0.0,
+            }
             continue
 
         if name not in accepted:
@@ -172,8 +194,11 @@ def parse_utilization(path: Path) -> dict:
             available = float(cells[columns["Available"]].replace(",", ""))
         except (KeyError, IndexError, ValueError):
             continue
-        row = {"used": used, "available": available,
-               "fraction": (used / available) if available else 0.0}
+        row = {
+            "used": used,
+            "available": available,
+            "fraction": (used / available) if available else 0.0,
+        }
         # `Prohibited` is carried for the rows that can be excluded from a region, because
         # CARRY4's denominator is derived from the F8-Muxes row's available + prohibited.
         try:
@@ -196,8 +221,14 @@ def parse_timing(path: Path) -> dict:
             for follow in lines[index + 1 : index + 4]:
                 values = re.findall(r"[-+]?\d+\.\d+", follow)
                 if len(values) >= 4:
-                    result.update({"wns_ns": float(values[0]), "tns_ns": float(values[1]),
-                                   "whs_ns": float(values[2]), "ths_ns": float(values[3])})
+                    result.update(
+                        {
+                            "wns_ns": float(values[0]),
+                            "tns_ns": float(values[1]),
+                            "whs_ns": float(values[2]),
+                            "ths_ns": float(values[3]),
+                        }
+                    )
                     return result
     return result
 
@@ -205,14 +236,27 @@ def parse_timing(path: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--stage", choices=("synth", "impl", "bitstream"), required=True)
-    parser.add_argument("--board", type=Path, required=True, help="board run dir (holds wrapper.json)")
+    parser.add_argument(
+        "--board", type=Path, required=True, help="board run dir (holds wrapper.json)"
+    )
     parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--vivado", type=Path, default=DEFAULT_VIVADO)
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--timeout", type=int, default=7200)
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=None,
+        help="optional explicit execution timeout; no default limit",
+    )
     args = parser.parse_args()
+
+    if args.evidence.exists():
+        raise SystemExit("evidence file already exists; use a new attempt evidence path")
+
+    if args.work.exists() and any(args.work.iterdir()):
+        raise SystemExit("stage attempt already has artifacts; use a new attempt directory")
 
     board = args.board.resolve()
     wrapper = json.loads((board / "wrapper.json").read_text(encoding="utf-8"))
@@ -222,10 +266,8 @@ def main() -> int:
     rtl_dir = board / "rtl"
     project_name = f"{wrapper['top']}_board"
 
-    if args.stage == "synth":
-        staged_rtl = stage_rtl(board, wrapper)
-    else:
-        staged_rtl = None
+    # Preserve identity at every producing stage, including continuation inputs.
+    staged_rtl = stage_rtl(board, wrapper)
 
     if args.stage in {"impl", "bitstream"}:
         # A checkpoint older than the RTL would silently implement the previous design:
@@ -234,9 +276,7 @@ def main() -> int:
         checkpoint = board / "synth.dcp"
         if not checkpoint.is_file():
             raise SystemExit(f"no synthesis checkpoint to implement: {checkpoint}")
-        newest_source = max(
-            [p.stat().st_mtime for p in rtl_dir.glob("*.v")] or [0.0]
-        )
+        newest_source = max([p.stat().st_mtime for p in rtl_dir.glob("*.v")] or [0.0])
         if checkpoint.stat().st_mtime < newest_source:
             raise SystemExit(
                 "STALE_CHECKPOINT: synth.dcp is older than the RTL sources; re-run the "
@@ -244,12 +284,21 @@ def main() -> int:
             )
 
     values = {
-        "PROJECT_NAME": project_name, "ROOT": board.as_posix(), "PART": part,
-        "TOP": top, "RTL_DIR": rtl_dir.as_posix(), "XDC": (rtl_dir / "board.xdc").as_posix(),
-        "THREADS": args.threads, "BITSTREAM": (board / f"{top}.bit").as_posix(),
+        "PROJECT_NAME": project_name,
+        "ROOT": board.as_posix(),
+        "PART": part,
+        "TOP": top,
+        "RTL_DIR": rtl_dir.as_posix(),
+        "XDC": (rtl_dir / "board.xdc").as_posix(),
+        "THREADS": args.threads,
+        "BITSTREAM": (board / f"{top}.bit").as_posix(),
     }
-    template = TEMPLATES / {"synth": "run_synth.tcl", "impl": "run_impl.tcl",
-                            "bitstream": "write_bitstream.tcl"}[args.stage]
+    template = (
+        TEMPLATES
+        / {"synth": "run_synth.tcl", "impl": "run_impl.tcl", "bitstream": "write_bitstream.tcl"}[
+            args.stage
+        ]
+    )
     script = board / f"{args.stage}.tcl"
     script.write_text(render(template, values), encoding="utf-8")
 
@@ -259,18 +308,30 @@ def main() -> int:
         "files": {p.name: sha256_file(p) for p in sorted(rtl_dir.glob("*")) if p.is_file()},
     }
     evidence: dict = {
-        **(identity_fields(args.deployment, (wrapper.get("board") or {}).get("pins_profile")) if args.deployment else {}),
+        **(
+            identity_fields(args.deployment, (wrapper.get("board") or {}).get("pins_profile"))
+            if args.deployment
+            else {}
+        ),
         "schema_version": 1,
         "stage": f"vivado_{args.stage}",
         "skill": "vivado-manager",
         "part": part,
         "top": top,
         "board_dir": str(board),
-        "contract": {"path": str(args.deployment.resolve()),
-                     "sha256": sha256_file(args.deployment.resolve())},
-        "tool": {"argv": execution["argv"], "returncode": execution["returncode"],
-                 "timed_out": execution["timed_out"], "duration_s": execution["duration_s"]},
+        "contract": {
+            "path": str(args.deployment.resolve()),
+            "sha256": sha256_file(args.deployment.resolve()),
+        },
+        "tool": {
+            "argv": execution["argv"],
+            "returncode": execution["returncode"],
+            "timed_out": execution["timed_out"],
+            "duration_s": execution["duration_s"],
+        },
         "status": "NOT_RUN",
+        "hardware_verified": False,
+        "status_scope": "tool_execution_and_physical_capacity_only",
         "artifacts": {},
         "rtl_used": rtl_record,
     }
@@ -286,15 +347,25 @@ def main() -> int:
     else:
         evidence["status"] = "PASSED"
 
-    for name in ("utilization_synth.rpt", "utilization_routed.rpt", "timing_routed.rpt",
-                 "drc_routed.rpt", "synth.dcp", "routed.dcp"):
+    for name in (
+        "utilization_synth.rpt",
+        "utilization_routed.rpt",
+        "timing_routed.rpt",
+        "drc_routed.rpt",
+        "synth.dcp",
+        "routed.dcp",
+    ):
         candidate = board / name
         if candidate.is_file():
-            evidence["artifacts"][name] = {"path": str(candidate), "sha256": sha256_file(candidate),
-                                           "bytes": candidate.stat().st_size}
+            evidence["artifacts"][name] = {
+                "path": str(candidate),
+                "sha256": sha256_file(candidate),
+                "bytes": candidate.stat().st_size,
+            }
 
-    utilization = parse_utilization(board / ("utilization_routed.rpt" if args.stage != "synth"
-                                             else "utilization_synth.rpt"))
+    utilization = parse_utilization(
+        board / ("utilization_routed.rpt" if args.stage != "synth" else "utilization_synth.rpt")
+    )
     if utilization:
         evidence["resources"] = utilization
     timing = parse_timing(board / "timing_routed.rpt")
@@ -304,11 +375,16 @@ def main() -> int:
     if args.stage == "bitstream" and evidence["status"] == "PASSED":
         bit = board / f"{top}.bit"
         if bit.is_file():
-            evidence["artifacts"]["bitstream"] = {"path": str(bit), "sha256": sha256_file(bit),
-                                                  "bytes": bit.stat().st_size}
+            evidence["artifacts"]["bitstream"] = {
+                "path": str(bit),
+                "sha256": sha256_file(bit),
+                "bytes": bit.stat().st_size,
+            }
         else:
             evidence["status"] = "FAILED"
-            evidence.setdefault("reasons", []).append("tool reported success but no bitstream was written")
+            evidence.setdefault("reasons", []).append(
+                "tool reported success but no bitstream was written"
+            )
 
     limit = float((contract.get("constraints") or {}).get("resource_fraction_max", 0.8))
     if utilization:
@@ -318,46 +394,58 @@ def main() -> int:
         # own -- that would silently widen the gate to an undeclared resource.
         gated = {label for label in RESOURCE_KEYS.values() if label in utilization}
         fractions = {key: utilization[key]["fraction"] for key in gated}
-        worst_key = max(fractions, key=fractions.get)
-        gate = {"limit": limit, "fractions": fractions, "worst": worst_key,
-                "worst_fraction": fractions[worst_key], "passed": fractions[worst_key] <= limit,
-                "gated_resources": sorted(fractions)}
+        worst_key = max(fractions, key=fractions.get) if fractions else None
+        worst_fraction = fractions[worst_key] if worst_key else None
+        gate = {
+            "limit": limit,
+            "fractions": fractions,
+            "worst": worst_key,
+            "worst_fraction": worst_fraction,
+            "passed": worst_fraction <= limit if worst_fraction is not None else None,
+            "diagnostic_only": True,
+            "gated_resources": sorted(fractions),
+        }
         evidence["resource_gate"] = gate
-        if not gate["passed"] and evidence["status"] == "PASSED":
-            evidence["status"] = "BLOCKED"
+        if worst_fraction is not None and worst_fraction > 1 and evidence["status"] == "PASSED":
+            evidence["status"] = "FAILED"
             evidence.setdefault("reasons", []).append(
-                f"RESOURCE_LIMIT: {worst_key} at {fractions[worst_key]:.4f} exceeds "
-                f"resource_fraction_max={limit}"
+                f"PHYSICAL_CAPACITY_EXCEEDED: {worst_key} at {worst_fraction:.4f}"
             )
 
-    # Unmet timing is a failed gate, not a footnote. Without this the stage reports
-    # PASSED with timing.met=false and the line would spend a write_bitstream run on a
-    # design that cannot clock at the contract's period; only the packager refused.
+    # User numerical acceptance does not impose a preselected timing-report target.
+    # Vendor execution errors and physical capacity failures above remain failures.
     if args.stage in {"impl", "bitstream"} and evidence.get("timing"):
         if evidence["timing"].get("met") is not True:
-            if evidence["status"] == "PASSED":
-                evidence["status"] = "FAILED"
-            evidence.setdefault("reasons", []).append(
+            evidence.setdefault("diagnostics", []).append(
                 "TIMING_NOT_MET: "
-                f"WNS={evidence['timing'].get('wns_ns')} ns, WHS={evidence['timing'].get('whs_ns')} ns "
+                f"WNS={evidence['timing'].get('wns_ns')} ns, "
+                f"WHS={evidence['timing'].get('whs_ns')} ns "
                 f"for clock period {contract.get('clock_period_ns')} ns"
             )
     elif args.stage in {"impl", "bitstream"}:
-        if evidence["status"] == "PASSED":
-            evidence["status"] = "FAILED"
-        evidence.setdefault("reasons", []).append(
+        evidence.setdefault("diagnostics", []).append(
             "no routed timing report was produced, so timing could not be checked"
         )
 
     args.evidence.resolve().parent.mkdir(parents=True, exist_ok=True)
-    args.evidence.resolve().write_text(json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8")
-    print(json.dumps({
-        "stage": evidence["stage"], "status": evidence["status"],
-        "returncode": execution["returncode"], "duration_s": execution["duration_s"],
-        "resource_gate": evidence.get("resource_gate"),
-        "timing": evidence.get("timing"),
-        "reasons": evidence.get("reasons"),
-    }, indent=2, ensure_ascii=False))
+    args.evidence.resolve().write_text(
+        json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    print(
+        json.dumps(
+            {
+                "stage": evidence["stage"],
+                "status": evidence["status"],
+                "returncode": execution["returncode"],
+                "duration_s": execution["duration_s"],
+                "resource_gate": evidence.get("resource_gate"),
+                "timing": evidence.get("timing"),
+                "reasons": evidence.get("reasons"),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

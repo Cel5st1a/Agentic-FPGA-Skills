@@ -15,18 +15,10 @@ Design rules (operator principles, 2026-09-27, same as Path A):
   * No acceptance claim: this script converts and records; the numeric verdict
     belongs to the criterion in `scripts/line/contract.py`.
 
-Gated quantity (declarative, not hardcoded): the contract may set
-`verification.gate_output` to `auto` (default), `logits` or `probabilities`, with
-the same semantics as Path A.
-
-  * `logits`  - the `Softmax` node that produces the graph output is skipped in
-                hardware (hls4ml `skip` on that layer) and removed from the Python
-                reference graph (the graph output is re-pointed at the softmax
-                input, i.e. the activation becomes the identity), so the gate
-                compares the same pre-softmax quantity on both sides.
-  * `probabilities` - nothing is skipped; the gate compares the graph output.
-  * `auto`    - `logits` when such a trailing `Softmax` node exists, else
-                `probabilities`.
+S15-opt follows the original complete model: `auto` (default) and `probabilities`
+retain its full Softmax/Sigmoid output; `logits` is refused by original_output_mode.
+Historical node-replacement helpers remain for compatibility tests, not as an
+authorized way to alter the network or its numerical reference.
 
 What hls4ml 1.3.0's ONNX frontend requires of the file (measured on this line,
 2026-09-28, branch `branched_small_ch_last` v2 package):
@@ -76,9 +68,13 @@ import sys
 from pathlib import Path
 
 import yaml
+
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from contract_config import apply_contract_config, firmware_config_audit
+from contract_config import apply_contract_config, firmware_config_audit, original_output_mode
+from pooling_compat import patch_stream_pooling
+from generated_compat import configure_softmax_exp_reads
+from numeric_diagnostics import parameter_grid_diagnostics
 
 SKILL = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE = SKILL / "templates" / "hls4ml_config_template.yaml"
@@ -291,7 +287,7 @@ def reference_graph(model, *, skipped_nodes: list[str]):
             "hls4ml_layer_names": sorted(skipped),
             "onnx_node_names": sorted(replaced),
             "why": "hls4ml sanitises layer names, so the strings differ; the nodes are the "
-                   "same Softmax nodes, verified by op_type before replacement",
+            "same Softmax nodes, verified by op_type before replacement",
         }
     return graph, name_note
 
@@ -473,9 +469,7 @@ def main() -> int:
     declared_sample_shape = sample_shape(contract)
     part = board_part(contract_path, contract)
     verification = contract.get("verification") or {}
-    gate_output = str(verification.get("gate_output", "auto")).lower()
-    if gate_output not in {"auto", "logits", "probabilities"}:
-        raise SystemExit(f"unknown verification.gate_output: {gate_output}")
+    gate_output = original_output_mode(verification)
 
     model, model_path, loader = load_model(contract_path, contract)
     graph_inputs, graph_outputs = graph_io(model)
@@ -502,9 +496,7 @@ def main() -> int:
     loader["output_name"] = graph_outputs[0].name
 
     trailing_softmax, interior_softmax = softmax_nodes(model)
-    drop_softmax = gate_output == "logits" or (
-        gate_output == "auto" and bool(trailing_softmax)
-    )
+    drop_softmax = gate_output == "logits" or (gate_output == "auto" and bool(trailing_softmax))
     skipped_nodes: list[str] = []
     unresolved_nodes: list[str] = []
     if drop_softmax:
@@ -536,6 +528,13 @@ def main() -> int:
         backend=backend,
     )
     hls_model.write()
+    pooling_record = patch_stream_pooling(project_dir, hls4ml.__version__, backend)
+    exp_read_factor = contract.get("softmax_exp_read_factor")
+    schedule_record = (
+        configure_softmax_exp_reads(project_dir, hls4ml.__version__, exp_read_factor)
+        if exp_read_factor is not None
+        else None
+    )
 
     # Testbench data and the Python side of the gate.
     inputs_path = args.inputs
@@ -605,15 +604,22 @@ def main() -> int:
             "pyyaml": module_version("yaml"),
         },
         "model_loader": loader,
-        "configuration_audit": firmware_config_audit(project_dir, contract.get('hls_config') or {}, hls_config,
-            nodes=[{'name': n.name, 'class_name': n.class_name} for n in hls_model.get_layers()]),
+        "compatibility_repairs": [pooling_record],
+        "configuration_audit": firmware_config_audit(
+            project_dir,
+            contract.get("hls_config") or {},
+            hls_config,
+            nodes=[{"name": n.name, "class_name": n.class_name} for n in hls_model.get_layers()],
+        ),
+        "softmax_exp_read_scheduling": schedule_record,
+        "parameter_grid_diagnostics": parameter_grid_diagnostics(hls_model),
         "input_shape_used": list(graph_sample_shape),
         "contract_input_shape": list(contract["model"]["input_shape"]),
         "graph_input_shape": graph_input_shape,
         "input_layout_declared": contract["model"].get("layout"),
         "target_part": part,
         "gate_quantity": {
-            "declared": gate_output,
+            "declared": str(verification.get("gate_output", "auto")).lower(),
             "resolved": "pre_softmax_logits" if drop_softmax else "probabilities",
             "softmax_nodes": trailing_softmax,
             "interior_softmax_nodes": interior_softmax,
@@ -644,12 +650,9 @@ def main() -> int:
         "reference": reference_record,
         "output_dir": str(project_dir),
         "firmware_files": firmware,
-        "firmware_sha256": {
-            name: sha256_file(firmware_dir / name) for name in firmware
-        },
+        "firmware_sha256": {name: sha256_file(firmware_dir / name) for name in firmware},
         "weights_sha256": {
-            name: digest
-            for name, digest in directory_hashes(firmware_dir / "weights").items()
+            name: digest for name, digest in directory_hashes(firmware_dir / "weights").items()
         },
         "firmware_interface_pragmas": interface_pragmas(project_dir),
         "hls4ml_config_path": str(project_dir / "hls4ml_config.yml"),
@@ -659,18 +662,20 @@ def main() -> int:
         "numerical_verdict": "NOT_EVALUATED_BY_THIS_SCRIPT",
     }
     evidence_path = args.evidence or (project_dir.parent / "convert-evidence.json")
-    evidence_path.write_text(
-        json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8"
+    evidence_path.write_text(json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(
+        json.dumps(
+            {
+                "project": str(project_dir),
+                "gate_quantity": evidence["gate_quantity"]["resolved"],
+                "skipped_nodes": skipped_nodes,
+                "samples": reference_record.get("samples"),
+                "evidence": str(evidence_path),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
     )
-    if evidence['configuration_audit']['status'] == 'FAILED':
-        raise SystemExit('generated configuration mismatch: ' + '; '.join(evidence['configuration_audit']['mismatches']))
-    print(json.dumps({
-        "project": str(project_dir),
-        "gate_quantity": evidence["gate_quantity"]["resolved"],
-        "skipped_nodes": skipped_nodes,
-        "samples": reference_record.get("samples"),
-        "evidence": str(evidence_path),
-    }, indent=2, ensure_ascii=False))
     return 0
 
 

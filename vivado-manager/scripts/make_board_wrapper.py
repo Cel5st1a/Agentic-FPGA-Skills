@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import re
 import sys
 from pathlib import Path
@@ -35,18 +34,15 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "board-host-io" / "scripts"))
-from line.geometry import declared_elements, flatten_sample, parse_precision as fixed_point, quantise, sample_rows
-from line.generated_geometry import stream_facts
 import board_facts
+from line.generated_geometry import parallel_facts, stream_facts
+from line.geometry import declared_elements, quantise, sample_rows
+from line.geometry import parse_precision as fixed_point
 
 MODULE_RE = re.compile(r"^\s*module\s+(\w+)\s*\((.*?)\);", re.S | re.M)
 DIRECTION_RE = re.compile(r"^\s*(input|output)\s*(\[[^\]]+\])?\s*([\w,\s]+);", re.M)
-PIN_RE = re.compile(
-    r"set_property\s+PACKAGE_PIN\s+(\w+)\s+\[get_ports\s+\{?(\w+)\}?\]", re.I
-)
-IOSTANDARD_RE = re.compile(
-    r"set_property\s+IOSTANDARD\s+(\w+)\s+\[get_ports\s+\{?(\w+)\}?\]", re.I
-)
+PIN_RE = re.compile(r"set_property\s+PACKAGE_PIN\s+(\w+)\s+\[get_ports\s+\{?(\w+)\}?\]", re.I)
+IOSTANDARD_RE = re.compile(r"set_property\s+IOSTANDARD\s+(\w+)\s+\[get_ports\s+\{?(\w+)\}?\]", re.I)
 CONTROL_PORTS = ("ap_start", "ap_done", "ap_ready", "ap_idle", "ap_ce")
 
 
@@ -63,7 +59,7 @@ def parse_ports(verilog: str, top: str) -> dict:
     if header is None:
         raise SystemExit(f"module '{top}' not found in the generated Verilog")
     ports: dict[str, dict] = {}
-    for match in DIRECTION_RE.finditer(verilog[header.end():]):
+    for match in DIRECTION_RE.finditer(verilog[header.end() :]):
         direction, width, names = match.group(1), match.group(2), match.group(3)
         bits = 1
         if width:
@@ -85,9 +81,12 @@ def load_samples(path: Path) -> list[list[float]]:
 def board_pins(profile: dict, profile_path: Path | None = None) -> dict:
     """The clock pins and reference frequency, read through the board-facts reader."""
     facts = board_facts.load_facts(profile, profile_path or Path("<profile>"))
-    return {"clk_p": facts.clock_pins[0],
-            "clk_n": facts.clock_pins[1] if len(facts.clock_pins) > 1 else None,
-            "clk_mhz": facts.reference_mhz, "kind": facts.clock_kind}
+    return {
+        "clk_p": facts.clock_pins[0],
+        "clk_n": facts.clock_pins[1] if len(facts.clock_pins) > 1 else None,
+        "clk_mhz": facts.reference_mhz,
+        "kind": facts.clock_kind,
+    }
 
 
 def clock_topology(facts) -> dict:
@@ -105,11 +104,16 @@ def clock_topology(facts) -> dict:
             "declarations": f"    input  wire {ports[0]},\n    input  wire {ports[1]},\n",
             "ibuf": f"    IBUFDS ref_input(.I({ports[0]}), .IB({ports[1]}), .O(refclk));",
             "tb_regs": f"    reg {ports[0]} = 0, {ports[1]} = 1, rst_n = 0;",
-            "tb_toggle": (f"    always #{half_period} begin {ports[0]} <= ~{ports[0]}; "
-                          f"{ports[1]} <= ~{ports[1]}; end"),
-            "tb_dut": (f"    board_top dut(.{ports[0]}({ports[0]}), .{ports[1]}({ports[1]}), "
-                       f".rst_n(rst_n), .led(led));"),
-            "ref_port": ports[0], "ports": ports,
+            "tb_toggle": (
+                f"    always #{half_period} begin {ports[0]} <= ~{ports[0]}; "
+                f"{ports[1]} <= ~{ports[1]}; end"
+            ),
+            "tb_dut": (
+                f"    board_top dut(.{ports[0]}({ports[0]}), .{ports[1]}({ports[1]}), "
+                f".rst_n(rst_n), .led(led));"
+            ),
+            "ref_port": ports[0],
+            "ports": ports,
         }
     return {
         "declarations": f"    input  wire {ports[0]},\n",
@@ -117,23 +121,29 @@ def clock_topology(facts) -> dict:
         "tb_regs": f"    reg {ports[0]} = 0, rst_n = 0;",
         "tb_toggle": f"    always #{half_period} begin {ports[0]} <= ~{ports[0]}; end",
         "tb_dut": f"    board_top dut(.{ports[0]}({ports[0]}), .rst_n(rst_n), .led(led));",
-        "ref_port": ports[0], "ports": ports,
+        "ref_port": ports[0],
+        "ports": ports,
     }
 
 
 def xdc_clock_pin_lines(facts) -> str:
-    return "\n".join(f"set_property PACKAGE_PIN {pin} [get_ports {port}]"
-                     for port, pin in zip(facts.clock_ports, facts.clock_pins))
+    return "\n".join(
+        f"set_property PACKAGE_PIN {pin} [get_ports {port}]"
+        for port, pin in zip(facts.clock_ports, facts.clock_pins, strict=True)
+    )
 
 
 def xdc_clock_standard_lines(facts, standard: str) -> str:
-    return "\n".join(f"set_property IOSTANDARD {standard} [get_ports {port}]"
-                     for port in facts.clock_ports)
+    return "\n".join(
+        f"set_property IOSTANDARD {standard} [get_ports {port}]" for port in facts.clock_ports
+    )
 
 
 def xdc_create_clock(facts) -> str:
-    return (f"create_clock -name board_ref -period {round(1000.0 / facts.reference_mhz, 4)} "
-            f"[get_ports {facts.clock_ports[0]}]")
+    return (
+        f"create_clock -name board_ref -period {round(1000.0 / facts.reference_mhz, 4)} "
+        f"[get_ports {facts.clock_ports[0]}]"
+    )
 
 
 def board_top_ports(facts) -> list:
@@ -152,9 +162,15 @@ def constraints_pins(path: Path) -> dict:
     return pins
 
 
-
-def axis_lane_geometry(verilog_dir: Path, top: str, tdata_in: int, tdata_out: int,
-                       in_elements: int | None, out_elements: int | None, element_bits: int) -> dict:
+def axis_lane_geometry(
+    verilog_dir: Path,
+    top: str,
+    tdata_in: int,
+    tdata_out: int,
+    in_elements: int | None,
+    out_elements: int | None,
+    element_bits: int,
+) -> dict:
     """Read sample extents/types from generated sources and check physical lane widths.
 
     Optional count arguments are assertions only; never sources. The legacy element_bits
@@ -162,29 +178,47 @@ def axis_lane_geometry(verilog_dir: Path, top: str, tdata_in: int, tdata_out: in
     """
     facts = stream_facts(verilog_dir, top)
     recorded_in, recorded_out = facts["input"]["elements"], facts["output"]["elements"]
-    for side, asserted, actual in (("input", in_elements, recorded_in),
-                                   ("output", out_elements, recorded_out)):
+    for side, asserted, actual in (
+        ("input", in_elements, recorded_in),
+        ("output", out_elements, recorded_out),
+    ):
         if asserted is not None and asserted != actual:
-            raise ValueError(f"interface.stream.{side}_elements: expected generated {actual}; actual {asserted!r}")
+            raise ValueError(
+                f"interface.stream.{side}_elements: expected generated {actual}; actual {asserted!r}"  # noqa: E501
+            )
     lanes_in, lanes_out = facts["input"]["lanes"], facts["output"]["lanes"]
     if tdata_in % lanes_in or tdata_out % lanes_out:
-        raise ValueError(f"interface.stream.TDATA: expected complete generated lanes {lanes_in}/{lanes_out}; actual {tdata_in}/{tdata_out} bits")
+        raise ValueError(
+            f"interface.stream.TDATA: expected complete generated lanes {lanes_in}/{lanes_out}; actual {tdata_in}/{tdata_out} bits"  # noqa: E501
+        )
     lane_in, lane_out = tdata_in // lanes_in, tdata_out // lanes_out
-    if lane_in != lane_out:
-        raise ValueError(f"interface.stream.lane_bits: expected equal input/output slot widths; actual {lane_in}/{lane_out}")
-    widest = max(facts["input"]["grid"]["total_bits"], facts["output"]["grid"]["total_bits"])
-    if lane_in < widest:
-        raise ValueError(f"interface.stream.lane_bits: expected at least {widest}; actual {lane_in}")
+    if (
+        lane_in < facts["input"]["grid"]["total_bits"]
+        or lane_out < facts["output"]["grid"]["total_bits"]
+    ):
+        raise ValueError("interface.stream.lane_bits: physical slot narrower than actual element")
     if recorded_in % lanes_in or recorded_out % lanes_out:
-        raise ValueError(f"interface.stream.sample_elements: expected whole beats of {lanes_in}/{lanes_out}; actual {recorded_in}/{recorded_out}")
-    return {"lane_bits": lane_in, "input_lanes_per_beat": lanes_in,
-            "output_lanes_per_beat": lanes_out,
-            "input_beats_per_sample": recorded_in // lanes_in,
-            "output_beats_per_sample": recorded_out // lanes_out,
-            "input_elements": recorded_in, "output_elements": recorded_out,
-            "input_element": facts["input"]["grid"], "output_element": facts["output"]["grid"],
-            "source": "firmware_defines", "firmware_headers": facts["firmware"],
-            "sample_geometry_source": facts["source"], "geometry_files": facts["files"]}
+        raise ValueError(
+            f"interface.stream.sample_elements: expected whole beats of {lanes_in}/{lanes_out}; actual {recorded_in}/{recorded_out}"  # noqa: E501
+        )
+    return {
+        "lane_bits": lane_in,
+        "output_lane_bits": lane_out,
+        "input_beat_bits": lanes_in * facts["input"]["grid"]["total_bits"],
+        "output_beat_bits": lanes_out * facts["output"]["grid"]["total_bits"],
+        "input_lanes_per_beat": lanes_in,
+        "output_lanes_per_beat": lanes_out,
+        "input_beats_per_sample": recorded_in // lanes_in,
+        "output_beats_per_sample": recorded_out // lanes_out,
+        "input_elements": recorded_in,
+        "output_elements": recorded_out,
+        "input_element": facts["input"]["grid"],
+        "output_element": facts["output"]["grid"],
+        "source": "firmware_defines",
+        "firmware_headers": facts["firmware"],
+        "sample_geometry_source": facts["source"],
+        "geometry_files": facts["files"],
+    }
 
 
 def render_axis_board(out_dir: Path, out_ctx: dict) -> dict:
@@ -215,6 +249,7 @@ def render_axis_board(out_dir: Path, out_ctx: dict) -> dict:
     tdata_in, tdata_out = out_ctx["tdata_bits"], out_ctx["tdata_out_bits"]
     in_lanes, out_lanes = out_ctx["in_lanes"], out_ctx["out_lanes"]
     lane_bits = out_ctx["lane_bits"]
+    output_lane_bits = out_ctx.get("output_lane_bits", lane_bits)
     in_beats, out_beats = out_ctx["in_beats"], out_ctx["out_beats"]
     sample_count = out_ctx["sample_count"]
     index_bits = max(1, (sample_count - 1).bit_length())
@@ -228,26 +263,28 @@ def render_axis_board(out_dir: Path, out_ctx: dict) -> dict:
     lane_pad = lane_bits - elem_bits
     # Verilog for "sign-extend the element into its TDATA slot". Built as a plain string
     # because brace escaping inside the f-string template is unreadable.
-    lane_expr = ("lane_element" if lane_pad == 0 else
-                 "{{" + str(lane_pad) + "{lane_element[ELEM_BITS-1]}}, lane_element}")
     # Per-lane source for the beat word when the ROM is beat-organised: lane j of the
     # presented beat is `rom_data_q[j]`, the registered word fetched for that element.
-    lane_expr_rom = ("rom_data_q[lane]" if lane_pad == 0 else
-                     "{{" + str(lane_pad) + "{rom_data_q[lane][ELEM_BITS-1]}}, rom_data_q[lane]}")
+    lane_expr_rom = (
+        "rom_data_q[lane]"
+        if lane_pad == 0
+        else "{{" + str(lane_pad) + "{rom_data_q[lane][ELEM_BITS-1]}}, rom_data_q[lane]}"
+    )
     # Address width for the beat-organised ROM: it holds SAMPLE_COUNT*IN_ELEMENTS words, so
     # it needs enough bits to hold that count (not just count-1).
     rom_addr_bits = max(1, (sample_count * in_elements).bit_length())
     core_conn = ",\n".join(f"        {item}" for item in out_ctx["core_connections"])
 
-    (out_dir / "board_top.v").write_text(f"""// Generated by the vivado-manager skill for {out_ctx['board_id']} ({out_ctx['part']}).
-// Core interface: AXI-Stream, ap_fixed<{out_ctx['total']},{out_ctx['integer']}> per element.
+    (out_dir / "board_top.v").write_text(
+        f"""// Generated by the vivado-manager skill for {out_ctx["board_id"]} ({out_ctx["part"]}).
+// Core interface: AXI-Stream, ap_fixed<{out_ctx["total"]},{out_ctx["integer"]}> per element.
 // One beat carries {in_lanes} input elements at a {lane_bits}-bit slot stride, so a sample is
 // {in_beats} input beats and {out_beats} output beats ({out_lanes} elements per output beat).
 // Board-facing pins are only the ones the profile can supply: clock, reset, status LED.
 `timescale 1ns / 1ps
 
 module board_top (
-{topology['declarations']}    input  wire rst_n,
+{topology["declarations"]}    input  wire rst_n,
     output wire led
 );
     localparam integer SAMPLE_COUNT   = {sample_count};
@@ -268,9 +305,9 @@ module board_top (
     localparam [1:0] S_RUN = 2'd0, S_DONE = 2'd1;
 
     wire refclk, clk_raw, feedback_raw, feedback, clk, locked;
-{topology['ibuf']}
-    MMCME2_BASE #(.CLKIN1_PERIOD({out_ctx['refclk_period']}), .CLKFBOUT_MULT_F({out_ctx['mult']}),
-                  .DIVCLK_DIVIDE(1), .CLKOUT0_DIVIDE_F({out_ctx['divide']})) clock_generator (
+{topology["ibuf"]}
+    MMCME2_BASE #(.CLKIN1_PERIOD({out_ctx["refclk_period"]}), .CLKFBOUT_MULT_F({out_ctx["mult"]}),
+                  .DIVCLK_DIVIDE(1), .CLKOUT0_DIVIDE_F({out_ctx["divide"]})) clock_generator (
         .CLKIN1(refclk), .CLKFBIN(feedback), .CLKFBOUT(feedback_raw),
         .CLKOUT0(clk_raw), .LOCKED(locked), .PWRDWN(1'b0), .RST(~rst_n)
     );
@@ -303,7 +340,7 @@ module board_top (
     // driving TDATA from the registered data word and holding TVALID until the beat is
     // accepted, so the core still sees the same beats in the same order.
     reg [ELEM_BITS-1:0] beat_rom [0:SAMPLE_COUNT*IN_ELEMENTS-1];
-    initial $readmemh("{out_ctx['mem_path']}", beat_rom);
+    initial $readmemh("{out_ctx["mem_path"]}", beat_rom);
 
     // Registered ROM data for each lane of the beat being presented, and a flag saying that
     // data is valid for the *current* `in_index`. The ROM read is synchronous (address now,
@@ -346,7 +383,7 @@ module board_top (
     wire [{rom_addr_bits - 1}:0] rom_addr =
         (sample_index*IN_ELEMENTS + in_index);
 
-    {out_ctx['top']} core (
+    {out_ctx["top"]} core (
 {core_conn}
     );
 
@@ -465,9 +502,12 @@ module board_top (
 
     assign led = done_r | result_checksum[0];
 endmodule
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
 
-    (out_dir / "board_top_tb.v").write_text(f"""// Board-level per-value testbench for an AXI-Stream core. Every accepted output beat
+    (out_dir / "board_top_tb.v").write_text(
+        f"""// Board-level per-value testbench for an AXI-Stream core. Every accepted output beat
 // contributes OUT_LANES values, each read out of its own slot at the element's own
 // fixed-point width (the grid the HLS C++ log converts to); the row is closed when the
 // wrapper reports that the sample's {out_beats} beats have arrived. A cycle budget bounds a
@@ -475,21 +515,21 @@ endmodule
 `timescale 1ns / 1ps
 
 module board_top_tb;
-{topology['tb_regs']}
+{topology["tb_regs"]}
     wire led;
     // The wrapper's localparams are not visible at this scope, so the geometry the
     // testbench slices out of TDATA is declared again here. ELEM_BITS is the *output*
     // element width: the stream carries the element zero-extended inside its slot, so
     // slicing the contract's wider precision would read that padding as value.
     localparam integer ELEM_BITS    = {out_elem_bits};
-    localparam integer LANE_BITS    = {lane_bits};
+    localparam integer LANE_BITS    = {output_lane_bits};
     localparam integer OUT_LANES    = {out_lanes};
     localparam integer OUT_BEATS    = {out_beats};
     localparam integer SAMPLE_COUNT = {sample_count};
 
-{topology['tb_toggle']}
+{topology["tb_toggle"]}
 
-{topology['tb_dut']}
+{topology["tb_dut"]}
 
     integer results, samples, row_beats, lane, cycles;
     initial begin
@@ -531,7 +571,9 @@ module board_top_tb;
         $finish;
     end
 endmodule
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
 
     return {
         "style": "axis_stream_with_ap_ctrl_hs",
@@ -541,21 +583,28 @@ endmodule
         "output_port": out_name,
         "output_valid": out_valid,
         "output_ready": out_ready,
-        "stream": {"input_elements": in_elements, "output_elements": out_elements,
-                   "element_bits": elem_bits, "output_element_bits": out_elem_bits,
-                   "tdata_bits": tdata_in,
-                   "output_tdata_bits": tdata_out, "lane_bits": lane_bits,
-                   "input_lanes_per_beat": in_lanes, "output_lanes_per_beat": out_lanes,
-                   "input_beats_per_sample": in_beats, "output_beats_per_sample": out_beats,
-                   "lane_geometry_source": out_ctx["lane_geometry_source"],
-                   "firmware_headers": out_ctx.get("firmware_headers")},
-        "element_types": {"input": out_ctx["input_element"],
-                          "output": out_ctx["output_element"]},
+        "stream": {
+            "input_elements": in_elements,
+            "output_elements": out_elements,
+            "element_bits": elem_bits,
+            "output_element_bits": out_elem_bits,
+            "tdata_bits": tdata_in,
+            "output_tdata_bits": tdata_out,
+            "lane_bits": lane_bits,
+            "output_lane_bits": output_lane_bits,
+            "input_lanes_per_beat": in_lanes,
+            "output_lanes_per_beat": out_lanes,
+            "input_beats_per_sample": in_beats,
+            "output_beats_per_sample": out_beats,
+            "lane_geometry_source": out_ctx["lane_geometry_source"],
+            "firmware_headers": out_ctx.get("firmware_headers"),
+        },
+        "element_types": {"input": out_ctx["input_element"], "output": out_ctx["output_element"]},
         "control": sorted(out_ctx["control"]),
         "per_sample_handshake": "ap_start is raised once and held high; the core chains "
-                                "transactions, so a sample is delimited by its output beats",
+        "transactions, so a sample is delimited by its output beats",
         "row_delimiter": "the wrapper's own accepted-beat counter (one row per "
-                         "output_beats_per_sample beats), not ap_done",
+        "output_beats_per_sample beats), not ap_done",
         "checksum": "result_checksum",
     }
 
@@ -566,12 +615,19 @@ def main() -> int:
     parser.add_argument("--verilog-dir", type=Path, required=True)
     parser.add_argument("--top", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--board-profile", type=Path, default=None,
-                        help="profile carrying the clock pins when the contract's own does not")
+    parser.add_argument(
+        "--board-profile",
+        type=Path,
+        default=None,
+        help="profile carrying the clock pins when the contract's own does not",
+    )
     parser.add_argument("--reset-pin", default=None)
     parser.add_argument("--reset-iostandard", default=None)
-    parser.add_argument("--reset-provenance", default=None,
-                        help="where the reset pin comes from; recorded in the XDC and evidence")
+    parser.add_argument(
+        "--reset-provenance",
+        default=None,
+        help="where the reset pin comes from; recorded in the XDC and evidence",
+    )
     parser.add_argument("--led-port", default="LED1")
     parser.add_argument("--led-pin", default=None)
     parser.add_argument("--led-iostandard", default=None)
@@ -582,16 +638,30 @@ def main() -> int:
         "standard and provenance through board_facts (no constraints-name fallback).",
     )
     parser.add_argument("--clk-provenance", default=None)
-    parser.add_argument("--input-elements", type=int, default=None,
-                        help="elements per sample for an AXI-Stream input (one element per "
-                             "cycle); required for io_stream cores, ignored for ap_vld")
-    parser.add_argument("--output-elements", type=int, default=None,
-                        help="beats that make one sample on the AXI-Stream output; required "
-                             "as an optional assertion against the generated sample layout")
-    parser.add_argument("--reference-json", type=Path,
-                        help="generated reference sample table; otherwise use contract verification.references")
-    parser.add_argument("--force", action="store_true",
-                        help="regenerate this script's own outputs in a non-empty board directory")
+    parser.add_argument(
+        "--input-elements",
+        type=int,
+        default=None,
+        help="elements per sample for an AXI-Stream input (one element per "
+        "cycle); required for io_stream cores, ignored for ap_vld",
+    )
+    parser.add_argument(
+        "--output-elements",
+        type=int,
+        default=None,
+        help="beats that make one sample on the AXI-Stream output; required "
+        "as an optional assertion against the generated sample layout",
+    )
+    parser.add_argument(
+        "--reference-json",
+        type=Path,
+        help="generated reference sample table; otherwise use contract verification.references",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="regenerate this script's own outputs in a non-empty board directory",
+    )
     args = parser.parse_args()
 
     contract_path = args.deployment.resolve()
@@ -632,14 +702,18 @@ def main() -> int:
     width = len(samples[0])
     declared_shape = list((contract.get("model") or {}).get("input_shape") or [])
     if declared_shape and width != declared_elements(declared_shape):
-        raise SystemExit(f"model.input_shape: expected {declared_elements(declared_shape)} "
-                         f"values per sample; actual inputs width {width}")
+        raise SystemExit(
+            f"model.input_shape: expected {declared_elements(declared_shape)} "
+            f"values per sample; actual inputs width {width}"
+        )
     reference_entry = args.reference_json or (contract.get("verification") or {}).get("references")
     reference_rows = None
     if reference_entry:
         reference_path = (contract_path.parent / reference_entry).resolve()
-        reference_rows = sample_rows(json.loads(reference_path.read_text(encoding="utf-8-sig")),
-                                     f"references {reference_path}")
+        reference_rows = sample_rows(
+            json.loads(reference_path.read_text(encoding="utf-8-sig")),
+            f"references {reference_path}",
+        )
 
     # Two core interfaces exist in hls4ml 1.3.0, and which one appears depends on the
     # contract's io_type, not on the model:
@@ -652,16 +726,26 @@ def main() -> int:
     # -> 0 % CPU and no log growth; DEFECTS D-048).
     axis_input = next((n for n in data_inputs if n.endswith("_TDATA")), None)
     axis_output = next((n for n in outputs if n.endswith("_TDATA")), None)
-    axis_output_valid = next((n for n in outputs if n.startswith(axis_output[:-6])
-                              and n.endswith("_TVALID")), None) if axis_output else None
-    axis_output_ready = next((n for n in data_inputs if n.startswith(axis_output[:-6])
-                              and n.endswith("_TREADY")), None) if axis_output else None
+    axis_output_valid = (
+        next((n for n in outputs if n.startswith(axis_output[:-6]) and n.endswith("_TVALID")), None)
+        if axis_output
+        else None
+    )
+    axis_output_ready = (
+        next(
+            (n for n in data_inputs if n.startswith(axis_output[:-6]) and n.endswith("_TREADY")),
+            None,
+        )
+        if axis_output
+        else None
+    )
     style = "axis" if axis_input and axis_output else "ap_vld"
     # The grid the sample ROM is quantised on and the grid the board log is read on. The
     # ap_vld path has always used the contract's precision for both; the AXI-Stream path
     # replaces them with the generated stream element types, which are not always equal to
     # the contract's precision (see axis_lane_geometry).
-    rom_total, rom_integer, out_element_bits = total, integer, total
+    rom_total, rom_integer, out_element_bits, out_integer = total, integer, total, integer
+    parallel_geometry = None
 
     if style == "ap_vld":
         if len(word_inputs) != 1 or len(valid_inputs) != 1 or not outputs:
@@ -673,9 +757,22 @@ def main() -> int:
             )
         in_name, in_vld = word_inputs[0], valid_inputs[0]
         in_bits = ports[in_name]["bits"]
-        if in_bits % total:
-            raise SystemExit(f"input bus {in_bits} bits is not a multiple of {total}")
-        n_in = in_bits // total
+        try:
+            parallel_geometry = parallel_facts(verilog_dir, args.top)
+        except FileNotFoundError:
+            pass  # Explicit legacy RTL has no generated type source; keep declared-grid path.
+        if parallel_geometry:
+            in_fact, out_fact = parallel_geometry["input"], parallel_geometry["output"]
+            rom_total, rom_integer = in_fact["grid"]["total_bits"], in_fact["grid"]["integer_bits"]
+            out_element_bits = out_fact["grid"]["total_bits"]
+            out_integer = out_fact["grid"]["integer_bits"]
+            n_in = in_fact["elements"]
+            if in_name != in_fact["port"] or in_bits != n_in * rom_total:
+                raise ValueError("interface.parallel.input disagrees with generated header/bridge")
+        else:
+            if in_bits % total:
+                raise SystemExit(f"input bus {in_bits} bits is not a multiple of {total}")
+            n_in = in_bits // total
         # Status outputs (`*_ap_vld`) are captured for the checksum but are not result
         # columns: the C++ reference log carries only the data outputs, so comparing them
         # would fail on shape for a reason that has nothing to do with numerics.
@@ -683,34 +780,62 @@ def main() -> int:
         if not result_outputs:
             raise SystemExit(f"no result outputs to compare (saw {outputs})")
         for name in result_outputs:
-            if ports[name]["bits"] != total:
-                raise SystemExit(f"interface.output_bits.{name}: expected one {total}-bit "
-                                 f"scalar port; actual {ports[name]['bits']}")
+            if ports[name]["bits"] != out_element_bits:
+                raise SystemExit(
+                    f"interface.output_bits.{name}: expected one {out_element_bits}-bit "
+                    f"scalar port; actual {ports[name]['bits']}"
+                )
+        if parallel_geometry:
+            port, count = out_fact["port"], out_fact["elements"]
+            names = [f"{port}_{i}" for i in range(count)]
+            if result_outputs != names and not (count == 1 and result_outputs == [port]):
+                raise ValueError(
+                    "interface.parallel.output order/count differs from generated bridge"
+                )
         if reference_rows is not None and len(reference_rows[0]) != len(result_outputs):
-            raise SystemExit(f"references: expected {len(result_outputs)} result elements; "
-                             f"actual {len(reference_rows[0])}")
+            raise SystemExit(
+                f"references: expected {len(result_outputs)} result elements; "
+                f"actual {len(reference_rows[0])}"
+            )
     else:
         in_name = axis_input
-        in_vld = next((n for n in data_inputs if n.startswith(axis_input[:-6]) and n.endswith("_TVALID")), None)
+        in_vld = next(
+            (n for n in data_inputs if n.startswith(axis_input[:-6]) and n.endswith("_TVALID")),
+            None,
+        )
         if in_vld is None:
-            raise SystemExit(f"axis input {axis_input} has no _TVALID partner (ports: {sorted(ports)})")
-        if not any(n.endswith("_TREADY") and ports[n]["direction"] == "input" for n in outputs + data_inputs):
+            raise SystemExit(
+                f"axis input {axis_input} has no _TVALID partner (ports: {sorted(ports)})"
+            )
+        if not any(
+            n.endswith("_TREADY") and ports[n]["direction"] == "input"
+            for n in outputs + data_inputs
+        ):
             raise SystemExit(
                 f"axis output {axis_output} has no _TREADY partner (ports: {sorted(ports)})"
             )
         tdata_bits = ports[axis_input]["bits"]
         if tdata_bits < total:
-            raise SystemExit(f"axis input TDATA is {tdata_bits} bits, narrower than the contract's {total}")
-        geometry = axis_lane_geometry(verilog_dir, args.top, tdata_bits,
-                                      ports[axis_output]["bits"], None, None, total)
+            raise SystemExit(
+                f"axis input TDATA is {tdata_bits} bits, narrower than the contract's {total}"
+            )
+        geometry = axis_lane_geometry(
+            verilog_dir, args.top, tdata_bits, ports[axis_output]["bits"], None, None, total
+        )
         n_in = geometry["input_elements"]
         output_elements = geometry["output_elements"]
         if args.input_elements is not None and args.input_elements != n_in:
-            raise SystemExit(f"--input-elements: expected generated sample width {n_in}; actual {args.input_elements}")
+            raise SystemExit(
+                f"--input-elements: expected generated sample width {n_in}; actual {args.input_elements}"  # noqa: E501
+            )
         if args.output_elements is not None and args.output_elements != output_elements:
-            raise SystemExit(f"--output-elements: expected generated sample width {output_elements}; actual {args.output_elements}")
+            raise SystemExit(
+                f"--output-elements: expected generated sample width {output_elements}; actual {args.output_elements}"  # noqa: E501
+            )
         if reference_rows is not None and len(reference_rows[0]) != output_elements:
-            raise SystemExit(f"references: expected generated {output_elements} result elements; actual {len(reference_rows[0])}")
+            raise SystemExit(
+                f"references: expected generated {output_elements} result elements; actual {len(reference_rows[0])}"  # noqa: E501
+            )
         in_bits = n_in * geometry["input_element"]["total_bits"]
         result_outputs = []
         tdata_out_bits = ports[axis_output]["bits"]
@@ -720,7 +845,6 @@ def main() -> int:
         rom_total = geometry["input_element"]["total_bits"]
         rom_integer = geometry["input_element"]["integer_bits"]
         out_element_bits = geometry["output_element"]["total_bits"]
-
 
     board_path = (contract_path.parent / contract["board_profile"]).resolve()
     profile = yaml.safe_load(board_path.read_text(encoding="utf-8-sig"))
@@ -737,11 +861,17 @@ def main() -> int:
             "Pass --board-profile with a profile that does: the skills ship one under "
             "board-profiles/<BOARD>/board_profile.yaml, sourced from the board manual. "
             "Pins are never guessed."
-        )
-    part = (pins_profile.get("part") or (pins_profile.get("fpga") or {}).get("part")
-            or profile.get("part") or (profile.get("fpga") or {}).get("part"))
+        ) from exc
+    part = (
+        pins_profile.get("part")
+        or (pins_profile.get("fpga") or {}).get("part")
+        or profile.get("part")
+        or (profile.get("fpga") or {}).get("part")
+    )
     if not part:
-        raise SystemExit(f"neither board profile declares a part: {board_path}, {pins_profile_path}")
+        raise SystemExit(
+            f"neither board profile declares a part: {board_path}, {pins_profile_path}"
+        )
 
     constraints_file = pins_profile_path.parent / "default_constraints.xdc"
     known_pins = constraints_pins(constraints_file)
@@ -757,7 +887,7 @@ def main() -> int:
             f"{exc}. The contract names {board_path}; pass --board-profile with a profile "
             "that declares the board-facing pins with provenance (the skills ship them "
             "under board-profiles/<BOARD>/board_profile.yaml). Pins are never guessed."
-        )
+        ) from exc
     topology = clock_topology(facts)
     # A profile may declare the board-facing pins explicitly, with provenance. That is
     # what makes the step executable without a human retyping flags: the constraints
@@ -769,11 +899,16 @@ def main() -> int:
     declared_led = declared.get("led") or {}
     led = known_pins.get(args.led_port, {})
     led_pin = args.led_pin or declared_led.get("pin") or led.get("pin")
-    led_standard = (args.led_iostandard or declared_led.get("iostandard")
-                    or led.get("iostandard"))
-    led_source = ("--led-iostandard" if args.led_iostandard else
-                  "profile board_pins" if declared_led.get("iostandard") else
-                  f"{constraints_file}" if led.get("iostandard") else "default LVCMOS15")
+    led_standard = args.led_iostandard or declared_led.get("iostandard") or led.get("iostandard")
+    led_source = (
+        "--led-iostandard"
+        if args.led_iostandard
+        else "profile board_pins"
+        if declared_led.get("iostandard")
+        else f"{constraints_file}"
+        if led.get("iostandard")
+        else "default LVCMOS15"
+    )
     if not led_pin:
         raise SystemExit(
             f"no LED pin for port '{args.led_port}': not in {constraints_file} or the "
@@ -782,11 +917,20 @@ def main() -> int:
         )
     reset_pin = args.reset_pin or declared_reset.get("pin")
     reset_standard = args.reset_iostandard or declared_reset.get("iostandard") or "LVCMOS33"
-    reset_standard_source = ("--reset-iostandard" if args.reset_iostandard else
-                             "profile board_pins" if declared_reset.get("iostandard") else
-                             "default LVCMOS33 (no profile value)")
-    reset_pin_source = ("--reset-pin" if args.reset_pin else
-                        "profile board_pins" if declared_reset.get("pin") else None)
+    reset_standard_source = (
+        "--reset-iostandard"
+        if args.reset_iostandard
+        else "profile board_pins"
+        if declared_reset.get("iostandard")
+        else "default LVCMOS33 (no profile value)"
+    )
+    reset_pin_source = (
+        "--reset-pin"
+        if args.reset_pin
+        else "profile board_pins"
+        if declared_reset.get("pin")
+        else None
+    )
     reset_provenance = args.reset_provenance or declared_reset.get("provenance")
     if not reset_pin:
         candidate = known_pins.get("RESET_N", {})
@@ -807,9 +951,12 @@ def main() -> int:
     clk_standard = args.clk_iostandard or facts.clock_iostandard
     clk_provenance = args.clk_provenance or facts.provenance["clock"]
     clk_confirmation = declared_clock.get("requires_operator_confirmation")
-    reset_provenance_line = (f"# Reset pin provenance: {reset_provenance}\n"
-                            if reset_provenance else "")
-    reset_provenance_line = f"# Reset pin provenance: {reset_provenance}\n" if reset_provenance else ""
+    reset_provenance_line = (
+        f"# Reset pin provenance: {reset_provenance}\n" if reset_provenance else ""
+    )
+    reset_provenance_line = (
+        f"# Reset pin provenance: {reset_provenance}\n" if reset_provenance else ""
+    )
 
     if width != n_in:
         raise SystemExit(f"contract inputs have {width} values per sample, core takes {n_in}")
@@ -832,10 +979,10 @@ def main() -> int:
     mem_lines = []
     # Only the AXI-Stream wrapper was changed to a beat-organised ROM; the ap_vld branch
     # still reads one wide word per sample, so the .mem must match the interface in use.
-    interface_is_stream = (style == "axis")
+    interface_is_stream = style == "axis"
     for row in samples:
         words = []
-        for index, value in enumerate(row):
+        for value in row:
             # Element i of an hls4ml array port occupies bits [i*W +: W]: the first
             # element is the LOW word. Packing it MSB-first reverses the input vector,
             # which leaves the network computing on the wrong features (measured: board
@@ -874,45 +1021,65 @@ def main() -> int:
     divide = round(vco / core_mhz, 3)
 
     if style == "axis":
-        interface_record = render_axis_board(out_dir, {
-            "clock": clock, "reset": reset, "top": args.top,
-            "clock_topology": topology,
-            "in_name": in_name, "in_vld": in_vld,
-            "in_ready": next((n for n in ports if n.startswith(in_name[:-6]) and n.endswith("_TREADY")), None),
-            "out_name": axis_output,
-            "out_valid": axis_output_valid,
-            "out_ready": axis_output_ready,
-            "in_elements": n_in, "out_elements": output_elements,
-            "elem_bits": geometry["input_element"]["total_bits"],
-            "out_elem_bits": out_element_bits,
-            "input_element": geometry["input_element"],
-            "output_element": geometry["output_element"],
-            "integer": integer, "total": total,
-            "tdata_bits": ports[axis_input]["bits"],
-            "tdata_out_bits": tdata_out_bits,
-            "in_lanes": geometry["input_lanes_per_beat"],
-            "out_lanes": geometry["output_lanes_per_beat"],
-            "lane_bits": geometry["lane_bits"],
-            "in_beats": geometry["input_beats_per_sample"],
-            "out_beats": geometry["output_beats_per_sample"],
-            "lane_geometry_source": geometry["source"],
-            "firmware_headers": geometry["firmware_headers"],
-            "sample_count": sample_count,
-            "board_id": pins_profile.get("id") or profile.get("id"), "part": part,
-            "refclk_period": round(1000.0 / ref_mhz, 4), "mult": mult, "divide": divide,
-            "mem_path": mem_path.as_posix(),
-            "control": control,
-            "core_connections": [f".{clock}(clk)",
-                                 f".{reset}({reset_expression})",
-                                 f".{in_name}(m_tdata)", f".{in_vld}(m_tvalid)",
-                                 f".{in_name[:-6]}_TREADY(m_tready)",
-                                 f".{axis_output}(s_tdata)",
-                                 f".{axis_output_valid}(s_tvalid)",
-                                 f".{axis_output_ready}(s_tready)",
-                                 ".ap_start(ap_start)", ".ap_done(ap_done)",
-                                 ".ap_idle(ap_idle)", ".ap_ready(ap_ready)"],
-        })
-        (out_dir / "board.xdc").write_text(f"""# Generated from the board profile: {pins_profile_path}
+        interface_record = render_axis_board(
+            out_dir,
+            {
+                "clock": clock,
+                "reset": reset,
+                "top": args.top,
+                "clock_topology": topology,
+                "in_name": in_name,
+                "in_vld": in_vld,
+                "in_ready": next(
+                    (n for n in ports if n.startswith(in_name[:-6]) and n.endswith("_TREADY")), None
+                ),
+                "out_name": axis_output,
+                "out_valid": axis_output_valid,
+                "out_ready": axis_output_ready,
+                "in_elements": n_in,
+                "out_elements": output_elements,
+                "elem_bits": geometry["input_element"]["total_bits"],
+                "out_elem_bits": out_element_bits,
+                "input_element": geometry["input_element"],
+                "output_element": geometry["output_element"],
+                "integer": integer,
+                "total": total,
+                "tdata_bits": ports[axis_input]["bits"],
+                "tdata_out_bits": tdata_out_bits,
+                "in_lanes": geometry["input_lanes_per_beat"],
+                "out_lanes": geometry["output_lanes_per_beat"],
+                "lane_bits": geometry["lane_bits"],
+                "output_lane_bits": geometry["output_lane_bits"],
+                "in_beats": geometry["input_beats_per_sample"],
+                "out_beats": geometry["output_beats_per_sample"],
+                "lane_geometry_source": geometry["source"],
+                "firmware_headers": geometry["firmware_headers"],
+                "sample_count": sample_count,
+                "board_id": pins_profile.get("id") or profile.get("id"),
+                "part": part,
+                "refclk_period": round(1000.0 / ref_mhz, 4),
+                "mult": mult,
+                "divide": divide,
+                "mem_path": mem_path.as_posix(),
+                "control": control,
+                "core_connections": [
+                    f".{clock}(clk)",
+                    f".{reset}({reset_expression})",
+                    f".{in_name}(m_tdata)",
+                    f".{in_vld}(m_tvalid)",
+                    f".{in_name[:-6]}_TREADY(m_tready)",
+                    f".{axis_output}(s_tdata)",
+                    f".{axis_output_valid}(s_tvalid)",
+                    f".{axis_output_ready}(s_tready)",
+                    ".ap_start(ap_start)",
+                    ".ap_done(ap_done)",
+                    ".ap_idle(ap_idle)",
+                    ".ap_ready(ap_ready)",
+                ],
+            },
+        )
+        (out_dir / "board.xdc").write_text(
+            f"""# Generated from the board profile: {pins_profile_path}
 # Pins come from the profile's board_pins block when it declares them, otherwise from
 # its constraints file: {constraints_file}
 # Clock pair IOSTANDARD provenance: {clk_provenance}
@@ -925,8 +1092,10 @@ set_property PACKAGE_PIN {reset_pin} [get_ports rst_n]
 set_property IOSTANDARD {reset_standard} [get_ports rst_n]
 set_false_path -from [get_ports rst_n]
 set_property PACKAGE_PIN {led_pin} [get_ports led]
-set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
-""", encoding="utf-8")
+set_property IOSTANDARD {led_standard or "LVCMOS15"} [get_ports led]
+""",
+            encoding="utf-8",
+        )
         record = {
             "schema_version": 1,
             "skill": "vivado-manager",
@@ -940,45 +1109,82 @@ set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
             "precision": contract["precision"],
             "samples": sample_count,
             "geometry_files": geometry["geometry_files"],
-            "output_layout": {"flatten": "c_order", "elements": output_elements,
-                              "source": "generated_bridge"},
-            "input_layout": {"flatten": "c_order", "elements": n_in,
-                             "source": "generated_bridge", "declared_shape": declared_shape},
-            "clock": {"reference_mhz": ref_mhz, "core_mhz": round(core_mhz, 4),
-                      "mmcm_mult": mult, "mmcm_divide": divide,
-                      "vco_mhz": round(ref_mhz * mult, 2)},
-            "board": {"contract_profile": str(board_path), "pins_profile": str(pins_profile_path),
-                      "pins_source": pins_source, "pins": pins,
-                      "part": part, "constraints_file": str(constraints_file),
-                      "led": {"port": args.led_port, "pin": led_pin,
-                              "iostandard": led_standard or "LVCMOS15",
-                              "iostandard_source": led_source},
-                      "clock_pair": {"iostandard": clk_standard, "provenance": clk_provenance,
-                                     "iostandard_source": ("--clk-iostandard" if args.clk_iostandard else
-                                                           "profile board_pins" if declared_clock.get("iostandard")
-                                                           else f"{constraints_file}"),
-                                     "requires_operator_confirmation": clk_confirmation},
-                      "reset": {"pin": reset_pin, "iostandard": reset_standard,
-                                "pin_source": reset_pin_source,
-                                "iostandard_source": reset_standard_source,
-                                "provenance": reset_provenance}},
+            "output_layout": {
+                "flatten": "c_order",
+                "elements": output_elements,
+                "source": "generated_bridge",
+            },
+            "input_layout": {
+                "flatten": "c_order",
+                "elements": n_in,
+                "source": "generated_bridge",
+                "declared_shape": declared_shape,
+            },
+            "clock": {
+                "reference_mhz": ref_mhz,
+                "core_mhz": round(core_mhz, 4),
+                "mmcm_mult": mult,
+                "mmcm_divide": divide,
+                "vco_mhz": round(ref_mhz * mult, 2),
+            },
+            "board": {
+                "contract_profile": str(board_path),
+                "pins_profile": str(pins_profile_path),
+                "pins_source": pins_source,
+                "pins": pins,
+                "part": part,
+                "constraints_file": str(constraints_file),
+                "led": {
+                    "port": args.led_port,
+                    "pin": led_pin,
+                    "iostandard": led_standard or "LVCMOS15",
+                    "iostandard_source": led_source,
+                },
+                "clock_pair": {
+                    "iostandard": clk_standard,
+                    "provenance": clk_provenance,
+                    "iostandard_source": (
+                        "--clk-iostandard"
+                        if args.clk_iostandard
+                        else "profile board_pins"
+                        if declared_clock.get("iostandard")
+                        else f"{constraints_file}"
+                    ),
+                    "requires_operator_confirmation": clk_confirmation,
+                },
+                "reset": {
+                    "pin": reset_pin,
+                    "iostandard": reset_standard,
+                    "pin_source": reset_pin_source,
+                    "iostandard_source": reset_standard_source,
+                    "provenance": reset_provenance,
+                },
+            },
             "top_ports": board_top_ports(facts),
-            "rom_image": {"path": str(mem_path), "sha256": sha256_file(mem_path),
-                          "layout": "one ELEM_BITS-wide word per element, "
-                                    "address = sample_index*input_elements + element_index",
-                          "words": len(mem_lines),
-                          "quantisation": "floor_toward_minus_infinity",
-                          "quantisation_note": "matches the ap_types cast the generated C++ "
-                                               "testbench applies when it assigns a float to "
-                                               "the ap_fixed port, so both sides of the board "
-                                               "gate receive the same input values",
-                          "grid": {"total_bits": rom_total, "integer_bits": rom_integer,
-                                   "source": geometry["input_element"]["source"]}},
-            "output_grid": {"total_bits": out_element_bits,
-                            "integer_bits": geometry["output_element"]["integer_bits"],
-                            "source": geometry["output_element"]["source"],
-                            "note": "the board log carries the output stream's element, so it is "
-                                    "scaled on this grid and not on the contract precision"},
+            "rom_image": {
+                "path": str(mem_path),
+                "sha256": sha256_file(mem_path),
+                "layout": "one ELEM_BITS-wide word per element, "
+                "address = sample_index*input_elements + element_index",
+                "words": len(mem_lines),
+                "quantisation": "floor_toward_minus_infinity",
+                "quantisation_note": "matches the ap_types cast the generated C++ "
+                "testbench applies when it assigns a float to "
+                "the ap_fixed port, so both sides of the board "
+                "gate receive the same input values",
+                "grid": {
+                    "total_bits": rom_total,
+                    "integer_bits": rom_integer,
+                    "source": geometry["input_element"]["source"],
+                },
+            },
+            "output_grid": {
+                "total_bits": out_element_bits,
+                "integer_bits": geometry["output_element"]["integer_bits"],
+                "source": geometry["output_element"]["source"],
+                "note": "the board log carries the output stream's element, so it is "
+                "scaled on this grid and not on the contract precision",
+            },
             "outputs": ["board_top.v", "board_top_tb.v", "board.xdc", "input_words.mem"],
             "notes": [
                 "the model's output stream has no board pin; accepted beats are folded into a "
@@ -990,18 +1196,23 @@ set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
                 "generated C++ stream types, or from the TDATA widths when those are absent",
             ],
         }
-        (out_dir / "wrapper.json").write_text(json.dumps(record, indent=2, ensure_ascii=False),
-                                              encoding="utf-8")
+        (out_dir / "wrapper.json").write_text(
+            json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
         print(json.dumps(record, indent=2, ensure_ascii=False))
         return 0
 
     wire_decl = "\n".join(f"    wire [{ports[n]['bits'] - 1}:0] {n};" for n in outputs)
     reg_decl = "\n".join(
-        f"    (* keep = \"true\" *) reg [{ports[n]['bits'] - 1}:0] {n}_r = 0;" for n in outputs
+        f'    (* keep = "true" *) reg [{ports[n]["bits"] - 1}:0] {n}_r = 0;' for n in outputs
     )
-    connections = [f".{clock}(clk)", f".{reset}({reset_expression})",
-                   f".{in_name}(input_word)", f".{in_vld}(input_vld)",
-                   ".ap_start(ap_start)"]
+    connections = [
+        f".{clock}(clk)",
+        f".{reset}({reset_expression})",
+        f".{in_name}(input_word)",
+        f".{in_vld}(input_vld)",
+        ".ap_start(ap_start)",
+    ]
     if "ap_ce" in control:
         connections.append(".ap_ce(1'b1)")
     connections += [f".{n}({n})" for n in outputs]
@@ -1017,21 +1228,22 @@ set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
     tb_reads = ",\n".join(f"            $signed(dut.{n}_r)" for n in result_outputs)
     tb_formats = " ".join("%0d" for _ in result_outputs)
 
-    (out_dir / "board_top.v").write_text(f"""// Generated by the vivado-manager skill for {pins_profile.get('id') or profile.get('id')} ({part}).
+    (out_dir / "board_top.v").write_text(
+        f"""// Generated by vivado-manager ({part}).
 // Core interface: ap_vld array with an ap_ctrl_hs control port; one packed {in_bits}-bit
 // input word ({n_in} x ap_fixed<{total},{integer}>), {len(outputs)} result outputs.
 // Board-facing pins are only the ones the profile can supply: clock pair, reset, status LED.
 `timescale 1ns / 1ps
 
 module board_top (
-{topology['declarations']}    input  wire rst_n,
+{topology["declarations"]}    input  wire rst_n,
     output wire led
 );
     localparam integer SAMPLE_COUNT = {sample_count};
     localparam integer INPUT_BITS   = {in_bits};
 
     wire refclk, clk_raw, feedback_raw, feedback, clk, locked;
-{topology['ibuf']}
+{topology["ibuf"]}
     MMCME2_BASE #(.CLKIN1_PERIOD({round(1000.0 / ref_mhz, 4)}), .CLKFBOUT_MULT_F({mult}),
                   .DIVCLK_DIVIDE(1), .CLKOUT0_DIVIDE_F({divide})) clock_generator (
         .CLKIN1(refclk), .CLKFBIN(feedback), .CLKFBOUT(feedback_raw),
@@ -1128,21 +1340,24 @@ module board_top (
 
     assign led = done_r | result_checksum[0];
 endmodule
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
 
-    (out_dir / "board_top_tb.v").write_text(f"""// Board-level per-value testbench. It waits for one capture pulse per sample and writes
+    (out_dir / "board_top_tb.v").write_text(
+        f"""// Board-level per-value testbench. It waits for one capture pulse per sample and writes
 // the captured result words as signed raw integers on the contract's fixed-point grid --
 // the same grid the HLS C++ log converts to. The wires are read hierarchically because
 // the board top deliberately exposes only board-legal pins.
 `timescale 1ns / 1ps
 
 module board_top_tb;
-{topology['tb_regs']}
+{topology["tb_regs"]}
     wire led;
 
-{topology['tb_toggle']}
+{topology["tb_toggle"]}
 
-{topology['tb_dut']}
+{topology["tb_dut"]}
 
     integer results, i;
     initial begin
@@ -1164,17 +1379,22 @@ module board_top_tb;
 
     initial begin
         #50ms;
-        $display("ERROR: board testbench timed out: locked=%b internal_rst=%b state=%0d sample_index=%0d ap_start=%b ap_done=%b ap_ready=%b ap_idle=%b input_vld=%b stamp=%b done=%b input_lo=%h",
+        $display({{"ERROR: board testbench timed out: locked=%b internal_rst=%b state=%0d ",
+                  "sample_index=%0d ap_start=%b ap_done=%b ap_ready=%b ap_idle=%b ",
+                  "input_vld=%b stamp=%b done=%b input_lo=%h"}},
                  dut.locked, dut.internal_rst, dut.state, dut.sample_index,
                  dut.ap_start, dut.ap_done, dut.ap_ready, dut.ap_idle,
                  dut.input_vld, dut.stamp, dut.done_r, dut.input_word[19:0]);
         $finish;
     end
 endmodule
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
 
     provenance = reset_provenance_line
-    (out_dir / "board.xdc").write_text(f"""# Generated from the board profile: {pins_profile_path}
+    (out_dir / "board.xdc").write_text(
+        f"""# Generated from the board profile: {pins_profile_path}
 # Pins come from the profile's board_pins block when it declares them, otherwise from
 # its constraints file: {constraints_file}
 # Clock pair IOSTANDARD provenance: {clk_provenance}
@@ -1189,8 +1409,10 @@ set_property PACKAGE_PIN {reset_pin} [get_ports rst_n]
 set_property IOSTANDARD {reset_standard} [get_ports rst_n]
 set_false_path -from [get_ports rst_n]
 set_property PACKAGE_PIN {led_pin} [get_ports led]
-set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
-""", encoding="utf-8")
+set_property IOSTANDARD {led_standard or "LVCMOS15"} [get_ports led]
+""",
+        encoding="utf-8",
+    )
 
     record = {
         "schema_version": 1,
@@ -1201,44 +1423,88 @@ set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
         "core_verilog_sha256": sha256_file(top_file),
         "top": args.top,
         "part": part,
-        "interface": {"style": "ap_vld_array_with_ap_ctrl_hs", "input": in_name, "valid": in_vld,
-                      "input_bits": in_bits, "elements": n_in, "control": sorted(control),
-                      "outputs": outputs, "result_outputs": result_outputs,
-                      "output_bits": {n: ports[n]["bits"] for n in outputs}},
+        "interface": {
+            "style": "ap_vld_array_with_ap_ctrl_hs",
+            "input": in_name,
+            "valid": in_vld,
+            "input_bits": in_bits,
+            "elements": n_in,
+            "control": sorted(control),
+            "outputs": outputs,
+            "result_outputs": result_outputs,
+            "output_bits": {n: ports[n]["bits"] for n in outputs},
+        },
         "precision": contract["precision"],
         "samples": sample_count,
-        "output_layout": {"flatten": "c_order", "elements": len(result_outputs),
-                          "ports": result_outputs, "source": "interface.result_outputs"},
+        "output_layout": {
+            "flatten": "c_order",
+            "elements": len(result_outputs),
+            "ports": result_outputs,
+            "source": "interface.result_outputs",
+        },
         "input_layout": {"flatten": "c_order", "elements": n_in, "declared_shape": declared_shape},
-        "clock": {"reference_mhz": ref_mhz, "core_mhz": round(core_mhz, 4),
-                  "mmcm_mult": mult, "mmcm_divide": divide, "vco_mhz": round(ref_mhz * mult, 2)},
-        "board": {"contract_profile": str(board_path), "pins_profile": str(pins_profile_path),
-                  "pins_source": pins_source, "pins": pins, "part": part,
-                  "constraints_file": str(constraints_file),
-                  "led": {"port": args.led_port, "pin": led_pin,
-                          "iostandard": led_standard or "LVCMOS15",
-                          "iostandard_source": led_source},
-                  "clock_pair": {"iostandard": clk_standard, "provenance": clk_provenance,
-                                 "iostandard_source": ("--clk-iostandard" if args.clk_iostandard else
-                                                       "profile board_pins" if declared_clock.get("iostandard")
-                                                       else f"{constraints_file}"),
-                                 "requires_operator_confirmation": clk_confirmation},
-                  "reset": {"pin": reset_pin, "iostandard": reset_standard,
-                            "pin_source": reset_pin_source,
-                            "iostandard_source": reset_standard_source,
-                            "provenance": reset_provenance}},
+        "clock": {
+            "reference_mhz": ref_mhz,
+            "core_mhz": round(core_mhz, 4),
+            "mmcm_mult": mult,
+            "mmcm_divide": divide,
+            "vco_mhz": round(ref_mhz * mult, 2),
+        },
+        "board": {
+            "contract_profile": str(board_path),
+            "pins_profile": str(pins_profile_path),
+            "pins_source": pins_source,
+            "pins": pins,
+            "part": part,
+            "constraints_file": str(constraints_file),
+            "led": {
+                "port": args.led_port,
+                "pin": led_pin,
+                "iostandard": led_standard or "LVCMOS15",
+                "iostandard_source": led_source,
+            },
+            "clock_pair": {
+                "iostandard": clk_standard,
+                "provenance": clk_provenance,
+                "iostandard_source": (
+                    "--clk-iostandard"
+                    if args.clk_iostandard
+                    else "profile board_pins"
+                    if declared_clock.get("iostandard")
+                    else f"{constraints_file}"
+                ),
+                "requires_operator_confirmation": clk_confirmation,
+            },
+            "reset": {
+                "pin": reset_pin,
+                "iostandard": reset_standard,
+                "pin_source": reset_pin_source,
+                "iostandard_source": reset_standard_source,
+                "provenance": reset_provenance,
+            },
+        },
         "top_ports": board_top_ports(facts),
-        "rom_image": {"path": str(mem_path), "sha256": sha256_file(mem_path),
-                      "quantisation": "floor_toward_minus_infinity",
-                      "quantisation_note": "matches the ap_types cast the generated C++ "
-                                           "testbench applies when it assigns a float to "
-                                           "the ap_fixed port, so both sides of the board "
-                                           "gate receive the same input values",
-                      "grid": {"total_bits": rom_total, "integer_bits": rom_integer,
-                               "source": "contract_precision"}},
-        "output_grid": {"total_bits": out_element_bits, "integer_bits": rom_integer,
-                        "source": "contract_precision",
-                        "note": "the ap_vld result ports carry the contract's precision"},
+        "rom_image": {
+            "path": str(mem_path),
+            "sha256": sha256_file(mem_path),
+            "quantisation": "floor_toward_minus_infinity",
+            "quantisation_note": "matches the ap_types cast the generated C++ "
+            "testbench applies when it assigns a float to "
+            "the ap_fixed port, so both sides of the board "
+            "gate receive the same input values",
+            "grid": {
+                "total_bits": rom_total,
+                "integer_bits": rom_integer,
+                "source": "firmware_defines" if parallel_geometry else "contract_precision",
+            },
+        },
+        "output_grid": {
+            "total_bits": out_element_bits,
+            "integer_bits": out_integer,
+            "source": "firmware_defines" if parallel_geometry else "contract_precision",
+            "note": "actual generated result type when available; legacy declaration otherwise",
+        },
+        "geometry_files": parallel_geometry["files"] if parallel_geometry else {},
         "outputs": ["board_top.v", "board_top_tb.v", "board.xdc", "input_words.mem"],
         "notes": [
             "the model's result words stay internal and are captured per sample; the "
@@ -1247,7 +1513,9 @@ set_property IOSTANDARD {led_standard or 'LVCMOS15'} [get_ports led]
             "ap_start is driven: leaving it unconnected removes the whole network",
         ],
     }
-    (out_dir / "wrapper.json").write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "wrapper.json").write_text(
+        json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(json.dumps(record, indent=2, ensure_ascii=False))
     return 0
 

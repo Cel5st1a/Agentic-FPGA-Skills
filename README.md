@@ -2,7 +2,7 @@
 
 15 个用于机器学习模型 FPGA 部署的 agent skills，以及它们共用的确定性脚本、板卡配置和测试。覆盖环境检查、模型转换、HLS 构建、Vivado 实现、主机通信和部署记录。脚本可直接从命令行调用，无需 LLM。
 
-本仓库是 2026-10-22 的技能源快照。主要硬件目标为 **ALINX AX7A200B / xc7a200tfbg484-2（Artix-7 PL）**。仓库也保留 Nexys Video 配置和 Zynq 背景技能；这些文件不代表已完成跨板验证。
+当前版本为 **S15-opt4（2026-11-04）**，基于冻结 opt3。主要硬件目标为 **ALINX AX7A200B / xc7a200tfbg484-2（Artix-7 PL）**。仓库也保留 Nexys Video 配置和 Zynq 背景技能；这些文件不代表已完成跨板验证。
 
 ## 技能目录
 
@@ -63,3 +63,13 @@ python -m pytest tests/test_bringup_line.py tests/test_rom_package_board.py boar
 ## 许可证
 
 原创代码与文档采用 [MIT License](LICENSE)。第三方代码保留自己的许可与版权声明，详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本仓库不包含 AMD 工具或 ALINX 板卡手册。
+
+## S15-opt4
+
+新增 Vitis/hls4ml 1.3.0 流式最大池化兼容路径。Keras 转换自动在生成工程中安装按结构选择的 2×2/stride2、无填充、完整通道包显式行缓存实现，其他形状调用原实现。兼容修改记录输入模板和输出哈希。
+
+板端采集从 verification.samples 读取正整数样本数，默认仍为 256，必须与输入条数一致。原 Python 误差判据仍为 .001+.001*abs(ref)。打包入口识别 host-board 并转交已有 host packager。打包拒绝属单独诊断，数值成功后无需为其重新部署。
+
+C++ 与 RTL 大幅分歧时，先比较首层、池化边界和输出前张量，定位首个分歧再调整实现。
+
+QCNN 和 Autoencoder 的组内显式池化修复曾在 AX7A200B/Vitis 2026.1 上分别通过原 100 条输入实板比较。opt4 的泛化实现另经离线回归；本次版本发布未重新运行正式实板矩阵。详细验证范围见 VALIDATION.md。

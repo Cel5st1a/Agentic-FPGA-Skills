@@ -88,10 +88,50 @@ def project_name(project: Path) -> str:
 
 
 def write_options(project: Path, flags: dict) -> dict:
-    options = {"reset": 0, "csim": 0, "synth": 0, "cosim": 0, "validation": 0, "export": 0, "vsynth": 0}
+    options = {
+        "reset": 0,
+        "csim": 0,
+        "synth": 0,
+        "cosim": 0,
+        "validation": 0,
+        "export": 0,
+        "vsynth": 0,
+    }
     options.update(flags)
     (project / "build_opt.tcl").write_text(OPT_BLOCK.format(**options), encoding="utf-8")
+    bind_stage_options(project)
     return options
+
+
+OPTION_SOURCE = "source [file join [file dirname [info script]] build_opt.tcl]"
+
+
+def bind_stage_options(project: Path) -> dict:
+    """Bind the saved options to the real generated default block, before any stages.
+
+    hls4ml 1.3.0 embeds defaults and does not source build_opt.tcl. Merely writing
+    that file leaves csim/synth/cosim enabled. Keep generated Tcl otherwise intact.
+    """
+    script = project / "build_prj.tcl"
+    if not script.is_file():
+        return {"status": "UNKNOWN", "reason": "no generated build script"}
+    text = script.read_text(encoding="utf-8")
+    blocks = list(re.finditer(r"array\s+set\s+opt\s*\{[^{}]*\}", text))
+    if len(blocks) != 1:
+        return {"status": "UNKNOWN", "reason": "unrecognized generated option block"}
+    end = blocks[0].end()
+    tail = text[end:]
+    marker = "\n" + OPTION_SOURCE + "\n"
+    if not tail.startswith(marker):
+        # Do not move arbitrary existing Tcl; place the exact source immediately
+        # after defaults so it cannot be superseded by those defaults.
+        script.write_text(text[:end] + marker + tail, encoding="utf-8")
+    return {
+        "status": "BOUND",
+        "source": OPTION_SOURCE,
+        "build_prj_sha256": sha256_file(script),
+        "build_opt_sha256": sha256_file(project / "build_opt.tcl"),
+    }
 
 
 def _kill_tree(pid: int) -> None:
@@ -102,8 +142,7 @@ def _kill_tree(pid: int) -> None:
     runner writes tool output straight to files and kills the whole tree on timeout.
     """
     if os.name == "nt":
-        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                       capture_output=True, text=True)
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True)
     else:  # pragma: no cover - the project's toolchain is Windows
         import signal
 
@@ -119,8 +158,10 @@ def run_tool(tool: Path, project: Path, work: Path, timeout: int) -> dict:
     stdout_path = work / "stdout.txt"
     stderr_path = work / "stderr.txt"
     started = time.monotonic()
-    with stdout_path.open("w", encoding="utf-8", errors="replace") as out, \
-            stderr_path.open("w", encoding="utf-8", errors="replace") as err:
+    with (
+        stdout_path.open("w", encoding="utf-8", errors="replace") as out,
+        stderr_path.open("w", encoding="utf-8", errors="replace") as err,
+    ):
         process = subprocess.Popen(argv, cwd=str(project), stdout=out, stderr=err)
         try:
             returncode, timed_out = process.wait(timeout=timeout), False
@@ -133,32 +174,54 @@ def run_tool(tool: Path, project: Path, work: Path, timeout: int) -> dict:
                 process.kill()
     duration = round(time.monotonic() - started, 2)
     (work / "command.json").write_text(
-        json.dumps({"argv": argv, "cwd": str(project), "timeout_s": timeout,
-                    "returncode": returncode, "timed_out": timed_out,
-                    "duration_s": duration}, indent=2, ensure_ascii=False),
+        json.dumps(
+            {
+                "argv": argv,
+                "cwd": str(project),
+                "timeout_s": timeout,
+                "returncode": returncode,
+                "timed_out": timed_out,
+                "duration_s": duration,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
-    return {"argv": argv, "returncode": returncode, "timed_out": timed_out,
-            "duration_s": duration,
-            "stdout": stdout_path.read_text(encoding="utf-8", errors="replace"),
-            "stderr": stderr_path.read_text(encoding="utf-8", errors="replace")}
+    return {
+        "argv": argv,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "duration_s": duration,
+        "stdout": stdout_path.read_text(encoding="utf-8", errors="replace"),
+        "stderr": stderr_path.read_text(encoding="utf-8", errors="replace"),
+    }
 
 
-def collect(project: Path, work: Path, name: str) -> dict | None:
+def collect(
+    project: Path, work: Path, name: str, *, not_before: float | None = None
+) -> dict | None:
     canonical = project / "tb_data" / name
     source = None
-    if canonical.is_file():
+
+    def current(path):
+        return path.is_file() and (not_before is None or path.stat().st_mtime >= not_before)
+
+    if current(canonical):
         source = canonical
     else:
-        matches = [p for p in project.rglob(name) if p.is_file()]
+        matches = [p for p in project.rglob(name) if current(p)]
         if matches:
             source = max(matches, key=lambda path: path.stat().st_mtime)
     if source is None:
         return None
     target = work / name
     shutil.copyfile(source, target)
-    return {"file": name, "sha256": sha256_file(target),
-            "source_path": source.relative_to(project).as_posix()}
+    return {
+        "file": name,
+        "sha256": sha256_file(target),
+        "source_path": source.relative_to(project).as_posix(),
+    }
 
 
 def read_results(path: Path) -> list[list[float]]:
@@ -182,21 +245,48 @@ def main() -> int:
     parser.add_argument("--vitis-run", type=Path, default=DEFAULT_VITIS_RUN)
     parser.add_argument("--timeout", type=int, default=None)
     args = parser.parse_args()
-    if args.timeout is None:
-        args.timeout = 300 if args.stage == "cosim" else 1800
+
+    if args.evidence is not None and args.evidence.exists():
+        raise SystemExit("evidence file already exists; use a new attempt evidence path")
 
     project = args.project.resolve()
     work = args.work.resolve()
+    if work.exists() and any(work.iterdir()):
+        raise SystemExit("stage attempt already has artifacts; use a new attempt directory")
     if not (project / "build_prj.tcl").is_file():
         raise SystemExit(f"not an hls4ml project (no build_prj.tcl): {project}")
     if not args.vitis_run.is_file():
         raise SystemExit(f"vitis-run not found: {args.vitis_run}")
 
     options = write_options(project, STAGE_FLAGS[args.stage])
+    option_binding = bind_stage_options(project)
     work.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(project / "build_opt.tcl", work / "build-opt.tcl")
+    shutil.copyfile(project / "build_prj.tcl", work / "build-prj.tcl")
 
-    execution = run_tool(args.vitis_run, project, work, args.timeout)
+    started_wall = time.time()
+    launched = option_binding["status"] == "BOUND"
+    if launched:
+        execution = run_tool(args.vitis_run, project, work, args.timeout)
+    else:
+        execution = {
+            "argv": None,
+            "returncode": None,
+            "timed_out": False,
+            "duration_s": None,
+            "stdout": "",
+            "stderr": "",
+        }
+        (work / "not-launched.json").write_text(
+            json.dumps(
+                {
+                    "reason": "requested stage options could not be bound; no vendor work launched",
+                    "binding": option_binding,
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
     evidence: dict = {
         **(identity_fields(args.deployment) if args.deployment else {}),
         "schema_version": 1,
@@ -204,19 +294,28 @@ def main() -> int:
         "skill": "vitis-build-agent",
         "invocation_note": (
             "SKILL.md documents `vitis-run --mode hls --csim --work_dir ...`; vitis-run "
-            "on 2025.2 accepts `--mode hls --tcl <script>`, which is what ran here."
+            "accepts `--mode hls --tcl <script>`; tool.launched records whether it ran."
         ),
         "project": str(project),
         "options": options,
+        "stage_option_binding": option_binding,
         "build_opt_sha256": sha256_file(work / "build-opt.tcl"),
-        "tool": {"path": str(args.vitis_run), "argv": execution["argv"],
-                 "returncode": execution["returncode"], "timed_out": execution["timed_out"],
-                 "duration_s": execution["duration_s"]},
+        "tool": {
+            "launched": launched,
+            "path": str(args.vitis_run),
+            "argv": execution["argv"],
+            "returncode": execution["returncode"],
+            "timed_out": execution["timed_out"],
+            "duration_s": execution["duration_s"],
+        },
         "artifacts": {},
         "status": "NOT_RUN",
     }
 
-    if execution["timed_out"]:
+    if not launched:
+        evidence["status"] = "FAILED"
+        evidence["reasons"] = ["requested stage options not bound; tool was not launched"]
+    elif execution["timed_out"]:
         evidence["status"] = "BUDGET_EXHAUSTED"
         evidence["reasons"] = [f"stage exceeded {args.timeout}s"]
     elif execution["returncode"] != 0:
@@ -224,9 +323,12 @@ def main() -> int:
         evidence["reasons"] = [f"tool exit code {execution['returncode']}"]
     else:
         evidence["status"] = "PASSED"
+        if option_binding["status"] != "BOUND":
+            evidence["status"] = "FAILED"
+            evidence["reasons"] = ["requested stage options were not bound to generated Tcl"]
 
     if args.stage == "csim":
-        record = collect(project, work, "csim_results.log")
+        record = collect(project, work, "csim_results.log", not_before=started_wall)
         if record:
             evidence["artifacts"]["csim_results"] = record
         elif evidence["status"] == "PASSED":
@@ -234,7 +336,7 @@ def main() -> int:
             evidence.setdefault("reasons", []).append("no csim_results.log produced")
 
     if args.stage in {"cosim"}:
-        record = collect(project, work, "rtl_cosim_results.log")
+        record = collect(project, work, "rtl_cosim_results.log", not_before=started_wall)
         if record:
             evidence["artifacts"]["rtl_cosim_results"] = record
         # RTL must agree with the C++ per value. A tool exit code of 0 is not that
@@ -250,7 +352,10 @@ def main() -> int:
             reference = read_results(work / "csim_results.log")
             actual = read_results(work / "rtl_cosim_results.log")
             rtl_gate = compare(
-                "vitis_cosim_rtl_vs_cpp", reference, actual, criterion,
+                "vitis_cosim_rtl_vs_cpp",
+                reference,
+                actual,
+                criterion,
                 reference_source=csim_record["source_path"],
                 actual_source=rtl_record["source_path"],
             )
@@ -315,21 +420,29 @@ def main() -> int:
             target = work / report.name
             shutil.copyfile(report, target)
             evidence["artifacts"]["csynth_xml"] = {
-                "file": report.name, "sha256": sha256_file(target),
+                "file": report.name,
+                "sha256": sha256_file(target),
                 "source_path": report.relative_to(project).as_posix(),
             }
             try:
                 import xml.etree.ElementTree as ElementTree
 
                 root = ElementTree.parse(report).getroot()
-                used = {child.tag: float(child.text) for child in root.find(".//AreaEstimates/Resources")}
-                available = {child.tag: float(child.text)
-                             for child in root.find(".//AreaEstimates/AvailableResources")}
+                used = {
+                    child.tag: float(child.text)
+                    for child in root.find(".//AreaEstimates/Resources")
+                }
+                available = {
+                    child.tag: float(child.text)
+                    for child in root.find(".//AreaEstimates/AvailableResources")
+                }
                 evidence["resources_estimate"] = {
                     "kind": "csynth_estimate_not_the_resource_gate",
                     "used": used,
                     "available": available,
-                    "fraction": {k: round(used[k] / available[k], 4) for k in used if available.get(k)},
+                    "fraction": {
+                        k: round(used[k] / available[k], 4) for k in used if available.get(k)
+                    },
                 }
             except Exception as exc:  # noqa: BLE001 - the estimate is best effort, the gate is not
                 evidence.setdefault("reasons", []).append(f"csynth report not parsed: {exc}")
@@ -345,7 +458,10 @@ def main() -> int:
         reference = json.loads(args.reference.read_text(encoding="utf-8"))
         actual = read_results(work / "csim_results.log")
         gate = compare(
-            f"vitis_{args.stage}", reference, actual, criterion,
+            f"vitis_{args.stage}",
+            reference,
+            actual,
+            criterion,
             reference_source=str(args.reference),
             actual_source=evidence["artifacts"]["csim_results"]["source_path"],
         )
@@ -365,9 +481,12 @@ def main() -> int:
         "returncode": execution["returncode"],
         "duration_s": execution["duration_s"],
         "numerical_gate": (
-            {k: evidence["numerical_gate"][k]
-             for k in ("passed", "values", "max_abs_error", "max_error_over_tolerance")}
-            if "numerical_gate" in evidence else None
+            {
+                k: evidence["numerical_gate"][k]
+                for k in ("passed", "values", "max_abs_error", "max_error_over_tolerance")
+            }
+            if "numerical_gate" in evidence
+            else None
         ),
         "evidence": str(evidence_path),
     }

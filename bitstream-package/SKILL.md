@@ -9,6 +9,10 @@ allowed-tools: Bash, Read, Write, Grep, Glob
 
 # Bitstream Package
 
+S15-opt：本技能的旧 packager 保留为兼容构建审计入口，其资源、时序、csim、RTL 和报告
+完备性拒绝不构成用户数值验收失败。真实板测通过后不得为这些额外条件重新部署。
+按 [ORDER.md](../ORDER.md) 保留已有证据并记录打包限制；不得将打包成功或失败当作板端数值结论。
+
 ## Purpose
 Create deployment-ready FPGA bitstream packages with all metadata for
 reproducibility and deployment tracking.
@@ -151,3 +155,6 @@ packager writes no such files. The verdicts live in `evidence/*.json` and are su
 - Verify bitstream with `get_property` before packaging
 - Checksums prevent deployment of corrupted files
 - XSA file needed for Vitis platform projects (not just .bit)
+
+## Opt4 host variant selection
+The existing package_bitstream.py entry point selects package_host_bitstream.py when the run contains p3-build/host-board/wrapper.json. The host audit is also callable directly with the same arguments. A packaging refusal is recorded as a packaging limitation. After real numerical success, preserve existing raw evidence and do not rerun hardware to satisfy optional packaging audits.
