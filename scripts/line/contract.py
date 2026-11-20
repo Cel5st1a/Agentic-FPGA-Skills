@@ -23,7 +23,7 @@ from dataclasses import dataclass
 RULE_FOUR_LSB = "four_effective_output_lsbs"
 RULE_RANGE = "range_relative"
 RULE_ORIGINAL = "original_model_abs_rel"
-RULES = (RULE_FOUR_LSB, RULE_RANGE)
+RULES = (RULE_FOUR_LSB, RULE_RANGE, RULE_ORIGINAL)
 
 #: Absolute floor of the frozen rule, in output units. The operator's rule uses
 #: 0.001 when 4 * 2^-(W-I) is smaller (e.g. ap_fixed<24,6> -> 1.5e-5).
@@ -104,7 +104,9 @@ def criterion_from_deployment(contract: dict) -> Criterion:
         raise ValueError("contract has no precision; the LSB bound cannot be derived")
     lsb_bound = 4 * effective_lsb(precision)
     declared_atol = verification.get("atol")
-    if declared_atol is None:
+    if rule == RULE_ORIGINAL and declared_atol is None:
+        atol, atol_source = 0.001, "original_model_default"
+    elif declared_atol is None:
         atol, atol_source = lsb_bound, "derived_from_precision"
     else:
         atol, atol_source = float(declared_atol), "contract.verification.atol"
@@ -121,7 +123,7 @@ def criterion_from_deployment(contract: dict) -> Criterion:
     return Criterion(
         rule=rule,
         atol=atol,
-        rtol=float(verification.get("rtol", DEFAULT_RTOL)),
+        rtol=float(verification.get("rtol", 0.001 if rule == RULE_ORIGINAL else DEFAULT_RTOL)),
         rho=float(verification.get("rho", DEFAULT_RHO)),
         floor=float(verification.get("floor", DEFAULT_FLOOR)),
         samples=int(declared_samples if declared_samples is not None else DEFAULT_SAMPLES),
@@ -169,5 +171,9 @@ def original_model_criterion(contract: dict | None = None) -> Criterion:
         source="human_acceptance_20261021",
         rule_source="human_acceptance_20261021",
         atol_source="human_acceptance_20261021",
-        samples_source=("contract.verification.samples" if "samples" in (contract or {}).get("verification", {}) else "human_acceptance_20261021"),
+        samples_source=(
+            "contract.verification.samples"
+            if "samples" in (contract or {}).get("verification", {})
+            else "human_acceptance_20261021"
+        ),
     )

@@ -48,7 +48,7 @@ def test_diagnostics_do_not_replace_tool_result(
     contract = tmp_path / "deployment.yaml"
     contract.write_text(yaml.safe_dump({"constraints": {"resource_fraction_max": 0.8}}))
     monkeypatch.setattr(mod, "identity_fields", lambda *args: {})
-    monkeypatch.setattr(mod, "stage_rtl", lambda *args: {})
+    monkeypatch.setattr(mod, "stage_rtl", lambda *args: {"files": {}, "ip_scripts": []})
     monkeypatch.setattr(
         mod,
         "run_vivado",

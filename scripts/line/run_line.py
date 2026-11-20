@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -48,10 +49,29 @@ import yaml
 
 try:
     from .identity import identity_fields
+    from .process_scope import (
+        JOB_ENV,
+        PROOF_ENV,
+        process_identity,
+        record_recovered_scope,
+        scope_drained,
+        write_process_proof,
+    )
 except ImportError:  # direct script entry point
     from identity import identity_fields
+    from process_scope import (
+        JOB_ENV,
+        PROOF_ENV,
+        process_identity,
+        record_recovered_scope,
+        scope_drained,
+        write_process_proof,
+    )
 
 DEFAULT_SKILLS = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(DEFAULT_SKILLS / "hls4ml-convert/scripts"))
+from contract_config import model_frontend  # noqa: E402
+
 # The conversion environment depends on the frontend, and that is a property of the
 # model format, not of a particular model:
 #   * Keras / qKeras frontends: the hls4ml conversion env (TF 2.13.1, hls4ml 1.3.0).
@@ -59,12 +79,14 @@ DEFAULT_SKILLS = Path(__file__).resolve().parents[2]
 #     qonnx is what can execute a channels-last custom-domain graph to build the Python
 #     reference. Without it the conversion succeeds but the reference cannot be written.
 DEFAULT_PYTHON_KERAS = Path(r"D:\python_envs\hls4ml_conv\Scripts\python.exe")
-DEFAULT_PYTHON_ONNX = Path(r"D:\Agentic_FPGA_Deployment - 副本\.venv\Scripts\python.exe")
+DEFAULT_PYTHON_ONNX = Path(
+    r"D:\AgenticFPGAdeployment\Agentic_FPGA_Deployment\.venv\Scripts\python.exe"
+)
 #: A Keras 3 environment. Needed because the archive's *container kind* does not determine
 #: its Keras major version: `keras_archive` covers both, and a Keras 3 `.keras` container
 #: cannot be deserialised by Keras 2.13 at all. This env carries TF 2.21 / Keras 3.12 /
 #: hls4ml 1.3.0, so it can run the Keras 3 path and the later stages alike.
-DEFAULT_PYTHON_KERAS3 = Path(r"D:\Agentic_FPGA_Deployment - 副本\.venv\Scripts\python.exe")
+DEFAULT_PYTHON_KERAS3 = Path(r"D:\python_envs\afd-o13-keras3\Scripts\python.exe")
 FRONTEND_PYTHON = {
     "keras_json_weights": DEFAULT_PYTHON_KERAS,
     "qkeras_json_weights": DEFAULT_PYTHON_KERAS,
@@ -144,7 +166,7 @@ def resolve_interpreter(contract: dict, model_path: Path | None) -> Path:
     JSON graph, an unreadable or missing file -- keeps the frontend mapping unchanged, so
     no contract that is already verified can be silently re-pointed at another interpreter.
     """
-    frontend = (contract.get("model") or {}).get("frontend")
+    frontend = model_frontend(contract.get("model") or {})
     if frontend not in FRONTEND_PYTHON:
         raise SystemExit(
             f"no default interpreter for frontend {frontend!r}; pass --python. "
@@ -204,27 +226,41 @@ def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     if os.name == "nt":
-        import ctypes
-
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        STILL_ACTIVE = 259
-        handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
-        if not handle:
-            return False
-        try:
-            # OpenProcess also succeeds for a pid that has exited but is not yet reaped, so
-            # the exit code decides: anything but STILL_ACTIVE means the holder is gone.
-            code = ctypes.c_ulong()
-            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
-                return False
-            return code.value == STILL_ACTIVE
-        finally:
-            ctypes.windll.kernel32.CloseHandle(handle)
+        return process_identity(pid) is not None
     try:
         os.kill(pid, 0)
     except OSError:
         return False
     return True
+
+
+def _holder_alive(holder):
+    pid = holder.get("pid")
+    if type(pid) is not int or pid <= 0:
+        return False
+    born = holder.get("created_filetime")
+    if os.name == "nt" and born is not None:
+        return process_identity(pid) == {"pid": pid, "created_filetime": born}
+    return _pid_alive(pid)
+
+
+@contextmanager
+def _lock_claim():
+    # Keep this file in place so owners always coordinate on the same file object.
+    with LOCK_PATH.with_suffix(".claim").open("a+b") as claim:
+        if claim.tell() == 0:
+            claim.write(b"0")
+            claim.flush()
+        claim.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(claim.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(claim, fcntl.LOCK_EX)
+        yield
 
 
 class Lock:
@@ -236,6 +272,10 @@ class Lock:
         self.token = ""
 
     def __enter__(self) -> Lock:
+        with _lock_claim():
+            return self._acquire()
+
+    def _acquire(self) -> Lock:
         if LOCK_PATH.exists():
             raw = LOCK_PATH.read_text(encoding="utf-8", errors="replace")
             holder = {}
@@ -243,8 +283,16 @@ class Lock:
                 holder = json.loads(raw)
             except ValueError:
                 pass
+            if not isinstance(holder, dict):
+                raise SystemExit(f"invalid EDA lock record: {LOCK_PATH}")
             pid = holder.get("pid")
-            if pid and not _pid_alive(int(pid)):
+            alive = _holder_alive(holder)
+            scope = holder.get("process_scope")
+            if scope:
+                if alive or not scope_drained(scope["job_name"], Path(scope["proof"])):
+                    raise SystemExit(f"EDA lock holds an active process scope: {LOCK_PATH}")
+                record_recovered_scope(Path(scope["proof"]), scope["job_name"])
+            if pid and not alive:
                 print(
                     f"[run_line] clearing a stale lock (pid {pid} is gone): {raw.strip()}",
                     flush=True,
@@ -258,20 +306,52 @@ class Lock:
             else:
                 print(f"[run_line] overriding a live lock: {raw.strip()}", flush=True)
         self.token = secrets.token_hex(32)
-        LOCK_PATH.write_text(
-            json.dumps(
-                {
-                    "pid": os.getpid(),
-                    "delegation_sha256": hashlib.sha256(self.token.encode("ascii")).hexdigest(),
-                    "started": datetime.now().isoformat(timespec="seconds"),
-                    "argv": sys.argv,
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        holder = {
+            "pid": os.getpid(),
+            "delegation_sha256": self._token_hash(),
+            "started": datetime.now().isoformat(timespec="seconds"),
+            "argv": sys.argv,
+        }
+        if os.name == "nt":
+            holder.update(process_identity(os.getpid()))
+            job_name = os.environ.get(JOB_ENV)
+            if job_name:
+                if process_identity(os.getpid(), job_name) is None:
+                    raise ValueError("inherited process scope does not own this EDA worker")
+                holder["process_scope"] = {
+                    "job_name": job_name,
+                    "proof": os.environ[PROOF_ENV],
+                    "purpose": "inherited",
+                }
+        record = json.dumps(holder, ensure_ascii=False)
+        if self.force:
+            LOCK_PATH.write_text(record, encoding="utf-8")
+        else:
+            with LOCK_PATH.open("x", encoding="utf-8") as handle:
+                handle.write(record)
         self.acquired = True
         return self
+
+    def _token_hash(self):
+        return hashlib.sha256(self.token.encode("ascii")).hexdigest()
+
+    def _owns(self, holder):
+        return (
+            holder.get("pid") == os.getpid()
+            and holder.get("delegation_sha256") == self._token_hash()
+        )
+
+    def bind_process_scope(self, name: str, proof: Path) -> None:
+        with _lock_claim():
+            holder = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+            if not self.acquired or not self._owns(holder) or holder.get("process_scope"):
+                raise ValueError("process scope requires a current, unbound EDA acquisition")
+            holder["process_scope"] = {
+                "job_name": name,
+                "proof": str(proof.resolve()),
+                "purpose": "hls_scan",
+            }
+            write_process_proof(LOCK_PATH, holder)
 
     def child_environment(self) -> dict[str, str]:
         """Delegate this acquisition explicitly; OS ancestry is not an identity."""
@@ -283,23 +363,27 @@ class Lock:
             "AFD_LINE_LOCK_TOKEN": self.token,
         }
 
-    def __exit__(self, *_exc) -> None:
+    def __exit__(self, exc_type, *_exc) -> None:
+        with _lock_claim():
+            self._release(interrupted=exc_type is not None)
+
+    def _release(self, *, interrupted=False) -> None:
         if self.acquired and LOCK_PATH.exists():
             try:
                 holder = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-                if (
-                    holder.get("pid") == os.getpid()
-                    and holder.get("delegation_sha256")
-                    == hashlib.sha256(self.token.encode("ascii")).hexdigest()
+                scope = holder.get("process_scope")
+                check_scope = scope and (interrupted or scope["purpose"] == "hls_scan")
+                if self._owns(holder) and (
+                    not check_scope or scope_drained(scope["job_name"], Path(scope["proof"]))
                 ):
                     LOCK_PATH.unlink()
-            except (OSError, ValueError):
+            except (KeyError, OSError, ValueError):
                 pass
         self.acquired = False
         self.token = ""
 
 
-def require_delegated_lock(path: Path) -> None:
+def require_delegated_lock(path: Path, *, hls_run: Path | None = None) -> None:
     """Validate a live, specific acquisition, not an unreliable parent PID.
 
     A local cooperation protocol, not a sandbox against lock-file writers.
@@ -335,8 +419,28 @@ def require_delegated_lock(path: Path) -> None:
         or not secrets.compare_digest(hashlib.sha256(token.encode("utf-8")).hexdigest(), digest)
     ):
         refuse("missing, mismatched or expired acquisition credential")
-    if not _pid_alive(pid):
+    if not _holder_alive(holder):
         refuse("lock holder is not alive")
+    scope = holder.get("process_scope")
+    if scope and scope.get("purpose") == "hls_scan":
+        if hls_run is None or os.environ.get(JOB_ENV) != scope["job_name"]:
+            refuse("scope is reserved for its HLS scan workers")
+        if process_identity(os.getpid(), scope["job_name"]) is None:
+            refuse("worker is outside its Windows process scope")
+        candidates = Path(scope["proof"]).parent / "work/workflows/candidates"
+        if not hls_run.resolve().is_relative_to(candidates.resolve()):
+            refuse("run is outside this Odatix scan workspace")
+
+
+def check_hls_delegation(stages: list[str], force_lock: bool, run_dir: Path | None = None) -> None:
+    if force_lock:
+        raise ValueError("cannot force an EDA lock with delegated HLS")
+    if not set(stages) <= {"convert", "csim", "csynth"}:
+        raise ValueError("delegated execution is limited to HLS scan stages")
+    if run_dir is None:
+        require_delegated_lock(LOCK_PATH)
+    else:
+        require_delegated_lock(LOCK_PATH, hls_run=run_dir)
 
 
 def run(cmd: list[str], label: str, *, env=None) -> int:
@@ -468,6 +572,7 @@ def main() -> int:
         help="optional explicit diagnostic timeout; no default limit",
     )
     parser.add_argument("--force-lock", action="store_true")
+    parser.add_argument("--delegated-hls-lock", action="store_true")
     parser.add_argument(
         "--reuse",
         action="store_true",
@@ -506,7 +611,7 @@ def main() -> int:
     # The registry id is the model directory the run lives under: runs/<model>/<run-id>.
     model_id = args.model_id or run_dir.parent.name
     verilog_dir = project / "myproject_prj" / "solution1" / "syn" / "verilog"
-    frontend = contract["model"].get("frontend")
+    frontend = model_frontend(contract["model"])
     if args.python is None:
         # Resolved from the frontend AND the model file's own declared Keras version: a
         # Keras 3 `.keras` archive must not be handed to the Keras 2.13 interpreter, which
@@ -763,6 +868,9 @@ def main() -> int:
 
     needs_eda = any(stage in EDA_STAGES for stage in stages)
     results: list[dict] = []
+    if args.delegated_hls_lock:
+        check_hls_delegation(stages, args.force_lock, run_dir)
+        return _execute(plan, results, run_dir, identity=identity)
     context = Lock(args.force_lock) if needs_eda else None
     if context is None:
         return _execute(plan, results, run_dir, identity=identity)

@@ -3,6 +3,39 @@
 import copy
 import hashlib
 import re
+from pathlib import Path
+
+
+def model_frontend(model):
+    """Resolve the legacy Keras label from its explicit storage format."""
+    frontend = model.get("frontend")
+    if frontend != "keras":
+        return frontend
+    formats = {
+        "keras_json_weights": (".json", 1),
+        "keras_h5": (".h5", 0),
+        "keras_archive": (".keras", 0),
+    }
+    storage = model.get("format")
+    if storage not in formats:
+        raise ValueError(f"frontend 'keras' requires a supported model.format, got {storage!r}")
+    suffix, associated = formats[storage]
+    model_suffix = Path(model.get("path", "")).suffix.lower()
+    if model_suffix != suffix or len(model.get("associated_files") or []) != associated:
+        raise ValueError(f"model path or associated files do not match format {storage!r}")
+    return storage
+
+
+def select_backend(contract, template):
+    requested = contract.get("backend")
+    if requested in (None, ""):
+        return template.get("Backend", "Vivado")
+    key = str(requested).strip().casefold().removeprefix("hls4ml-")
+    vendors = {"vitis": "Vitis", "vivado": "Vivado", "quartus": "Quartus",
+               "catapult": "Catapult"}
+    if key not in vendors:
+        raise ValueError(f"Unsupported explicit hls4ml backend: {requested!r}")
+    return vendors[key]
 
 
 def original_output_mode(verification):

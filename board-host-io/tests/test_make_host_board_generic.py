@@ -21,6 +21,21 @@ SKILL = Path(__file__).resolve().parents[1]
 SCRIPTS = SKILL / "scripts"
 
 
+def test_missing_contract_reference_uses_fresh_conversion_output(tmp_path):
+    contract = tmp_path / "contract/model/deployment.yaml"
+    contract.parent.mkdir(parents=True)
+    contract.touch()
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    generated = evidence / "python-output.json"
+    generated.write_text("[[0.125, 0.5]]", encoding="ascii")
+    read = load("host_geometry").reference_rows_from_deployment
+    config = {"verification": {"references": "references.json"}}
+    assert read(contract, config) == [[0.125, 0.5]]
+    (contract.parent / "references.json").write_text("[[0.25, 0.5]]", encoding="ascii")
+    assert read(contract, config) == [[0.25, 0.5]]
+
+
 def load(name: str):
     spec = importlib.util.spec_from_file_location(name, SCRIPTS / f"{name}.py")
     module = importlib.util.module_from_spec(spec)

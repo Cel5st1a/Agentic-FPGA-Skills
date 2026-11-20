@@ -42,11 +42,24 @@ import yaml
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from contract_config import apply_contract_config, firmware_config_audit, original_output_mode
-from pooling_compat import patch_stream_pooling
-from pooling_compat import patch_stream_pooling
-from generated_compat import configure_softmax_exp_reads, patch_po2_product, pin_output_grid
+from contract_config import (
+    apply_contract_config,
+    firmware_config_audit,
+    model_frontend,
+    original_output_mode,
+    select_backend,
+)
+from generated_compat import (
+    configure_softmax_exp_reads,
+    patch_activation_table_range,
+    patch_elu_interpolation,
+    patch_po2_product,
+    patch_softsign_interpolation,
+    pin_output_grid,
+    sequential_dense_top,
+)
 from numeric_diagnostics import parameter_grid_diagnostics
+from pooling_compat import patch_stream_pooling
 
 SKILL = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE = SKILL / "templates" / "hls4ml_config_template.yaml"
@@ -110,7 +123,7 @@ def load_model(contract_path: Path, contract: dict):
     import tensorflow as tf
 
     model_spec = contract["model"]
-    frontend = model_spec.get("frontend")
+    frontend = model_frontend(model_spec)
     model_path = (contract_path.parent / model_spec["path"]).resolve()
     associated = [
         (contract_path.parent / p).resolve() for p in model_spec.get("associated_files") or []
@@ -331,9 +344,7 @@ def main() -> int:
     trailing_softmax = softmax_nodes(model)
     drop_softmax = gate_output == "logits" or (gate_output == "auto" and bool(trailing_softmax))
 
-    backend = (
-        "Vitis" if contract.get("backend") == "hls4ml-vitis" else template.get("Backend", "Vivado")
-    )
+    backend = select_backend(contract, template)
 
     # hls4ml names the activation node `<layer>_softmax` when a Dense/Conv layer carries
     # the activation, and keeps the layer name for a standalone Activation layer. The
@@ -393,7 +404,50 @@ def main() -> int:
         for p in (project_dir / "firmware").glob("*.h")
     )
     pooling_record = patch_stream_pooling(project_dir, hls4ml.__version__, backend)
-    pooling_record = patch_stream_pooling(project_dir, hls4ml.__version__, backend)
+    # A generated lookup-table activation may need a wider index map than the stock
+    # template offers; the deployment declares only the range, never a new function.
+    activation_records = [
+        patch_activation_table_range(project_dir, hls4ml.__version__, activation, table_range)
+        for activation, table_range in (contract.get("activation_table_ranges") or {}).items()
+    ]
+    ranges = contract.get("activation_table_ranges") or {}
+    for activation in contract.get("activation_table_interpolation") or []:
+        if activation == "elu":
+            activation_records.append(patch_elu_interpolation(project_dir, hls4ml.__version__))
+        elif activation == "softsign":
+            activation_records.append(
+                patch_softsign_interpolation(
+                    project_dir, hls4ml.__version__, int(ranges.get(activation, 8))
+                )
+            )
+        else:
+            raise ValueError(f"unsupported activation_table_interpolation entry: {activation!r}")
+    if contract.get("io_type") == "io_stream" and contract.get("activation_table_interpolation"):
+        from generated_compat import patch_stream_activations
+
+        activation_records.append(
+            patch_stream_activations(
+                project_dir, hls4ml.__version__, contract["activation_table_interpolation"]
+            )
+        )
+    schedule = contract.get("top_schedule")
+    sequential_record = None
+    if schedule is not None:
+        supported = all(
+            type(layer).__name__ in {"Dense", "InputLayer", "ReLU", "Activation"}
+            and getattr(getattr(layer, "activation", None), "__name__", "linear")
+            in {"relu", "linear"}
+            for layer in model.layers
+        )
+        if schedule != "sequential" or not supported:
+            raise ValueError("top_schedule=sequential is qualified only for parallel Dense/ReLU")
+        sequential_record = sequential_dense_top(
+            project_dir,
+            hls4ml.__version__,
+            backend,
+            contract["io_type"],
+            hls_model.config.get_project_name(),
+        )
     compat_record = patch_po2_product(project_dir, hls4ml.__version__) if uses_po2 else None
     exp_read_factor = contract.get("softmax_exp_read_factor")
     schedule_record = (
@@ -439,13 +493,18 @@ def main() -> int:
         "skill_path": str(SKILL / "SKILL.md"),
         "contract": {"path": str(contract_path), "sha256": sha256_file(contract_path)},
         "template": {"path": str(args.template), "sha256": sha256_file(args.template)},
+        "backend": {"requested": contract.get("backend"), "effective": backend},
         "environment": {
             "python": sys.version.split()[0],
             "tensorflow": tf.__version__,
             "hls4ml": hls4ml.__version__,
         },
         "model_loader": loader,
-        "compatibility_repairs": ([compat_record] if compat_record else []) + [pooling_record],
+        "compatibility_repairs": [
+            record
+            for record in (*activation_records, compat_record, pooling_record, sequential_record)
+            if record
+        ],
         "output_grid_pin": output_grid_record,
         "configuration_audit": firmware_config_audit(
             project_dir,

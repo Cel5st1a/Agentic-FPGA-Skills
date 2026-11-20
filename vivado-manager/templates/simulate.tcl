@@ -10,6 +10,9 @@ set files [glob {{RTL_DIR}}/*.v]
 set tb {{RTL_DIR}}/{{TB}}
 set files [lsearch -all -inline -not -exact $files $tb]
 add_files $files
+foreach script [list {{IP_SCRIPTS}}] {
+    source [file join {{RTL_DIR}} $script]
+}
 read_xdc {{XDC}}
 set_property top {{TOP}} [get_filesets sources_1]
 add_files -fileset sim_1 $tb

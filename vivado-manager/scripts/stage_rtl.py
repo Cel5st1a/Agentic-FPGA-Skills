@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -49,17 +50,35 @@ def _same_file(left: Path, right: Path) -> bool:
     return sha256_file(left) == sha256_file(right)
 
 
+def render_ip_script_list(names: list[str]) -> str:
+    if any(not re.fullmatch(r"[A-Za-z0-9_]+_ip\.tcl", name) for name in names):
+        raise ValueError("Unsupported generated IP script name")
+    return " ".join(f"{{{name}}}" for name in names)
+
+
 def core_sources(core: Path) -> dict[str, str]:
     """Snapshot exactly the flat core bundle consumed by this staging rule."""
     core = Path(core)
     if not core.is_file():
         raise FileNotFoundError(f"generated core not found: {core}")
-    return {
+    files = {
         p.name: sha256_file(p)
         for pattern in CORE_PATTERNS
         for p in sorted(core.parent.glob(pattern))
         if p.is_file()
     }
+    for source in sorted(core.parent.glob("*_ip.tcl")):
+        stem = source.stem.removesuffix("_ip")
+        rtl = core.parent / f"{stem}.v"
+        instantiates_ip = rf"(?m)^\s*{re.escape(source.stem)}\s+\w+\s*\("
+        if (
+            source.is_file()
+            and rtl.name in files
+            and f"{source.stem}.v" not in files
+            and re.search(instantiates_ip, rtl.read_text(encoding="utf-8", errors="replace"))
+        ):
+            files[source.name] = sha256_file(source)
+    return files
 
 
 def dependency_delta(previous: dict, current: dict) -> dict:
@@ -108,9 +127,7 @@ def stage_rtl(board: Path, wrapper: dict) -> dict:
             "preserve the old attempt and regenerate its dependency record"
         )
 
-    sources: list[Path] = []
-    for pattern in CORE_PATTERNS:
-        sources += sorted(core.parent.glob(pattern))
+    sources = [core.parent / name for name in current_core]
     for pattern in WRAPPER_PATTERNS:
         sources += sorted(board.glob(pattern))
     for relative in wrapper.get("extra_rtl", []):
@@ -172,6 +189,7 @@ def stage_rtl(board: Path, wrapper: dict) -> dict:
         "core_verilog": str(core),
         "core_verilog_sha256": sha256_file(core),
         "files": staged,
+        "ip_scripts": [name for name in current_core if name.endswith("_ip.tcl")],
         "copied": copied,
         "removed_stale": removed,
         "core_manifest_verification": "VERIFIED_CONTENT"

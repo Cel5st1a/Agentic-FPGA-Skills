@@ -1,5 +1,12 @@
 # FPGA 模型 → bitstream 与板级验证技能链
 
+## 用户明确要求四组数值与多方案优选时
+
+使用 [workflow-manager](workflow-manager/SKILL.md) 和 `scripts/line/run_workflow.py`。
+该入口要求全部原始输入的 G1/G2/G3/G4、六项两两比较，以及至少两个完成真实板测的不同候选。
+Odatix 负责候选批次执行和原生多目标排序，报告记录失败、定位、实测数据与选择依据。
+本模式在用户明确要求完整比较与优选时生效。
+
 本独立版本为 S15-opt4，继承 opt3 工具。新增工具和范围见 [opt3 使用说明](docs/opt3-tools.md)。
 宽流式数据移动采用固定移位；输入寄存器增加，不预先保证LUT/FF/布线收益。
 QKeras主机诊断保留原量化器；表/并行度摘要只描述生成源码，不决定可部署性。
@@ -17,21 +24,51 @@ S15-opt 内容身份快照：`scripts/line/identity.py --capture <request.json> 
 
 本目录是独立 S15-opt 修复副本。原技能、实验冻结输入和历史结果保持不变。
 
-## S15-opt 当前任务规则（优先于下文历史工作流）
+## AX7A200B 上板流程
 
-- 用户只给原模型、权重与公共输入；本任务要求完整模型真实上板，256 条完整输出满足 `abs(error)<=.001+.001*abs(ref)`。不裁剪 Sigmoid/Softmax，不用答案替代硬件结果。
-- 资源比例、预选时钟、时序报告、HLS 对照、cosim、协议诊断和打包完备度不增加验收门槛。真实厂商错误、无法生成或部署的实现仍是实际失败；电气和精确板卡要求保留。
-- `verify_board.py` 的 Python 对照决定数值结论，HLS 对照可缺省并单列。必须同时保留真实串口采集、原模型身份、下载来源等执行证据；直接调用纯比较函数并不证明上板。
-- 构建或采集失败时定位最小缺项，保留有效核心和每个尝试。成功后停止部署；不得为旧打包器或报告的额外条件重跑。
-- 下文旧阈值和固定阶段流程仅是兼容资料。`run_line.py` 与旧 packager 仍是历史确定性构建/审计入口，不是 S15-opt 自主任务必须逐项执行的验收关卡。
+用户授权部署时，在 AX7A200B 上运行完整原模型及权重，保留 Sigmoid 和 Softmax。用 `verify_board.py` 采集全部原始输入的串口响应，逐值与原 Python 输出比较 `abs(error)<=.001+.001*abs(ref)`。验收依据为下载的 bitstream、原始通信和逐值比较。
+
+新契约用 `bootstrap_run.py` 创建运行目录。确认工具、板卡和串口后，可用
+`scripts/line/run_uart.py --deployment <运行目录内的契约> --run <运行目录> --python <对应解释器> --port <实际端口>`
+一次执行转换、HLS、UART 构建、端口审计、下载和采集。已有构建或某步失败时查看
+`logs/uart-deployment/steps.jsonl` 及对应日志，复用同一尝试中仍适用的工件并按下列分步命令恢复。
+
+1. 使用 `run_line.py --stages convert,csynth,wrapper` 生成 HLS 核和接口记录。可用 `csim` 定位数值问题。对于量化卷积，先核对生成的流接口和各层有效 RF。`io_stream` 可避免 `io_parallel` 在大空间张量上完全展开数组的开销。遇到 HLS 完全分割造成的异常展开时，先看实际生成代码，再选择合适接口和复用因子。
+2. 按 [board-host-io](board-host-io/SKILL.md) 生成 UART host wrapper，直接用 `build_host.py` 构建，依次执行端口审计、易失 JTAG 下载和 `verify_board.py`。由环境启用 Odatix 时，该入口会记录实际批次和构建证据。ROM 仿真、ROM 物理实现和发布包用于相应的诊断或交付任务。
+3. 构建或采集失败时定位最小缺项，保留有效核心、失败记录和诊断。全部原始输入已通过板端数值验收后结束部署。真实厂商错误和已核对的板卡电气约束仍需处理。
 - `softmax_exp_read_factor` 是组内可选择的生成调度项，仅在已识别的模板上修改表读取 pragma。保持完整指数、求和、归一化；缺省不改调度，不固定历史模型的 RF、精度或表深度。
 - 先看转换证据的 `parameter_grid_diagnostics` 和实际偏差，再分别调整权重、累加和非线性。小于 LSB 不等于已被量化为零；舍入模式、资源和数值收益需要测量。
 - `local_precision_search.py --role weight|bias|result|accum|table|exp_table|inv_table|inv_inp --trace-layers` 可显式执行单层单角色主机C++候选。追踪只比较有对应Keras边界的层输出，融合后无法对应的层保持未知；最早观察到偏差的层不是已证明的根因，不代表内部累加轨迹。先跑基线，满足容差即停止；不自动改原契约或替代板测。
-- 无默认墙钟或调用次数上限；长时间安静不代表卡死。只按实际进程和日志事实诊断。硬件授权与当前状态以用户和campaign账本为准；本opt3开发副本不授权访问硬件，不得替换任何正在运行的冻结臂。
+- 依据用户的授权和板卡占用状态执行下载。长时间安静时，核对实际进程和日志后再决定等待或定位问题。
 
 开始或恢复部署前读 [转换与上板恢复规则](docs/deployment-recovery.md)：核对配置及结构改动实际生效、区分模型与接口包装成本、保存真实阶段状态，并以同一 run 的完整证据验收代理完成状态。监控策略取当前任务授权，实验策略不作为技能默认。
 
 模型结构选择先看 [跨前端效率路径](docs/efficiency-by-model-family.md)：Dense/Sigmoid、深层Dense/Softmax、QKeras、ONNX分支与Conv1D/2D分别诊断，不把某个模型的RF/位宽或修复套到其他模型。
+
+
+## Odatix 并行扫描候选
+
+在部署契约和板卡已确认后，可先用 `scripts/line/scan_hls.py` 扫描一组显式候选。候选 JSON 是对象列表，每个对象提供 `id`、`reuse_factor` 和 `precision`。指定 `--jobs 2` 可同时运行两个候选，默认逐个运行。部署契约使用自包含模型包，权重和样本的路径以契约所在目录为起点。
+
+```powershell
+& <模型Python> scripts/line/scan_hls.py --deployment <deployment.yaml> --cases <cases.json> --output <新目录> --skills <本技能根目录> --python <模型Python> --odatix <odatix.exe> --jobs 2 --finalists 2
+```
+
+每个任务独立运行转换、CSim 和 HLS 综合。原模型逐值容差筛选通过且有效配置和 HLS 估算完整的候选，按最坏周期数、峰值估算占用和 ID 排序。批次报告保存所有任务的状态和日志。下一阶段读取 `selection.json` 中的入围运行及其契约。
+
+以 `run_uart.py --reuse-hls --build-only` 对入围候选生成 UART bitstream 并审计端口。按实际布线时序及资源排序后，使用 `run_uart.py --verify-only --port <实际端口>` 依次下载和采集。交付以原模型全量真板逐值验收为准。
+
+
+
+## 四级数值门禁回传
+
+每个扫描候选返回独立的 `gates.json`，Odatix 记录该文件的哈希。扫描汇总的每个候选在 `gate_feedback` 下携带 `G1` 至 `G4`。CSim 数值拒绝的候选也保留回传。校验失败时报告 `feedback_error`，没有上板的候选显示 `G4 = NOT_RUN`。
+
+- G1 校验原模型、权重、输入和原模型 Python 输出的来源与覆盖。
+- G2 对已验证的 hls4ml Vitis Dense/ReLU MLP 生成独立整数参考。其他生成模板显示 `NOT_COVERED`。G2 偏差用于诊断。
+- G3 保留 CSim 对原模型的筛选。对于已覆盖的模板，额外报告 CSim 顶层输出码与 G2 的逐码差异，并记录首个差异的样本与输出索引。
+- G4 由独立真板审计更新。最终仍使用实际下载的 bitstream 和完整 UART 输出，直接按原模型逐值容差验收。G3 通过而 G4 超差时，报告建议先做定向 RTL 重放。
+
 
 ## opt2 最短有效路径（优先于下文历史阶段清单）
 
@@ -209,7 +246,12 @@ P3 的 `reuse-factor-resource-tuning` 同样是**单独调用**的咨询步骤�
 | `model.frontend` | 解释器 | 原因 |
 | --- | --- | --- |
 | `keras_json_weights` / `qkeras_json_weights` / `keras_h5` / `keras_archive` | `D:\python_envs\hls4ml_conv\Scripts\python.exe` | TF 2.13.1 (Keras v2) + hls4ml 1.3.0 |
-| `onnx` | `D:\Agentic_FPGA_Deployment - 副本\.venv\Scripts\python.exe` | 额外含 onnxruntime + qonnx；qonnx 才能执行 channels-last 自定义域图并生成 Python 参考 |
+| `keras_h5` / `keras_archive`，归档声明 Keras 3 | `D:\python_envs\afd-o13-keras3\Scripts\python.exe` | Keras 3 + hls4ml 1.3.0 |
+| `onnx` | `D:\AgenticFPGAdeployment\Agentic_FPGA_Deployment\.venv\Scripts\python.exe` | qonnx 可执行 channels-last 自定义域图并生成 Python 参考 |
+
+`model.frontend: keras` 的旧契约按显式 `model.format`、模型文件扩展名和关联文件数分流。
+例如 `model.format: keras_json_weights` 需要 JSON 图和一个关联权重文件。
+`bootstrap_run.py` 与 `run_line.py` 共用分流及默认解释器规则，契约副本保持原始字节。
 
 ## 五、板卡档案
 
@@ -233,3 +275,7 @@ P3 的 `reuse-factor-resource-tuning` 同样是**单独调用**的咨询步骤�
 当原 Python 与 CSim 接近而 RTL/板端有明显偏差时，先复用现有日志和工程，比较首个计算层、池化边界及输出前张量，定位第一个不一致的边界，再修改对应实现。连续候选产生相同错误值时停止盲目扫描 RF、位宽或非线性表。RTL/CSim 均属定位手段，用户验收仍是完整原模型真实板端输出的原 Python 数值比较。
 Vitis/hls4ml 1.3.0 的生成工程自动加入按结构选择的显式池化兼容实现。仅 2x2/stride2、无填充、一个像素的全部通道占一个数据包的 MaxPooling2D 使用该路径，其他形状保留原实现。修改记录进入转换证据。
 采集样本数从 verification.samples 读取，未声明时沿用 256。必须与实际输入条数一致，不能重复输入凑样本数。
+
+## Odatix implementation batches
+
+When several candidates are needed, see [Odatix candidate batches](docs/odatix-candidate-batches.md). Candidate batching is optional. For a single implementation use the existing one-run build path unless the task is explicitly testing the Odatix path.

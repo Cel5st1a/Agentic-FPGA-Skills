@@ -8,6 +8,8 @@ description: >
 allowed-tools: Bash, Read, Write, Edit, Grep, Glob
 ---
 
+When Vitis HLS emits a vendor IP script beside a Verilog wrapper that instantiates that IP, the Vivado synthesis path stages the paired script and records its hash with the core bundle. Check `staged_rtl.ip_scripts` in synthesis evidence when elaboration reports a missing generated module. The same source bundle must be available for checkpoint continuation.
+
 # Vivado Manager
 
 本版优先遵守 [ORDER.md 的用户数值标准](../ORDER.md)。综合、实现/布线、bitstream 分别记录真实执行与耗时，复合构建起点不能代替当前阶段起点。资源比例和 WNS/WHS 保留为诊断，不凭报告目标拒收数值已通过的结果；真实容量超限、不可布线、厂商错误及电气安全要求不忽略。bitstream 或退出码不证明硬件成功。使用新的尝试目录保留每次原始输出，不静默覆盖。
@@ -174,3 +176,7 @@ ipx::unload_core [ipx::find_open_core user.org:hls:top_module:1.0]
 - Checkpoint files (.dcp) at each major step enable rollback
 - Project directory can be archived/deleted safely
 - Source files and constraints are never modified by Vivado Manager
+
+## Run a candidate batch through Odatix
+
+Keep the same Tcl and vendor options for a direct-versus-Odatix control. Use [the candidate batch contract](../docs/odatix-candidate-batches.md) to stage complete inputs. Check each job's result and report before selecting an artifact. Use a distinct job for an independent repeat.

@@ -179,3 +179,7 @@ Recommended config from workflow #1:
 - 性能必须带计时起止、时钟与来源。HLS latency、II 和 `compute_cycles` 是不同口径；适配器往返周期不含 UART 线时，也不等于核 latency/II。检查完整数组，报告样本数、首项/稳态或范围；仿真与实板的喂数/握手节奏不同，应分别报告，不能只取首项或相互套用。口径不一致时不计算加速比。
 
 上述统计可随 run 报告/补充记录保存，不表示现有 `record_workflow.py` 已自动采集 SDK 指标或硬件证据。录入前按 [部署恢复规则](../docs/deployment-recovery.md) 核对实际验证层级。
+
+## Record a candidate batch
+
+Record the batch and producing candidate IDs, effective-input identity, actual job count, raw evidence paths and first usable result. Preserve failures and missing metrics. A same-batch alias is one request and zero extra EDA invocations. Independent repeats are separate jobs.

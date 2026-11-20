@@ -79,11 +79,15 @@ def test_program_records_interruption_before_rethrow(monkeypatch, tmp_path, erro
 
 def test_program_persists_failure_before_xsdb(monkeypatch, tmp_path):
     proof(monkeypatch)
-    output = tmp_path / "attempt"
+    monkeypatch.chdir(tmp_path)
+    output = Path("nested/attempt")
 
-    def xsdb(*args, **kwargs):
+    def xsdb(command, cwd, **kwargs):
         persisted = json.loads((output / "summary.json").read_text())
         assert persisted["programmed"] is False
+        script = Path(command[-1])
+        assert script.is_absolute() and script == cwd.resolve() / "program.tcl"
+        assert script.is_file()
         return SimpleNamespace(returncode=0, stdout=good_log(), stderr="")
 
     monkeypatch.setattr(program, "run_xsdb", xsdb)

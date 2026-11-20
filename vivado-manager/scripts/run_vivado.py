@@ -22,7 +22,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from stage_rtl import stage_rtl  # noqa: E402
+from stage_rtl import render_ip_script_list, stage_rtl  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from line.identity import identity_fields  # noqa: E402
@@ -276,7 +276,9 @@ def main() -> int:
         checkpoint = board / "synth.dcp"
         if not checkpoint.is_file():
             raise SystemExit(f"no synthesis checkpoint to implement: {checkpoint}")
-        newest_source = max([p.stat().st_mtime for p in rtl_dir.glob("*.v")] or [0.0])
+        newest_source = max(
+            ((rtl_dir / name).stat().st_mtime for name in staged_rtl["files"]), default=0.0
+        )
         if checkpoint.stat().st_mtime < newest_source:
             raise SystemExit(
                 "STALE_CHECKPOINT: synth.dcp is older than the RTL sources; re-run the "
@@ -292,6 +294,7 @@ def main() -> int:
         "XDC": (rtl_dir / "board.xdc").as_posix(),
         "THREADS": args.threads,
         "BITSTREAM": (board / f"{top}.bit").as_posix(),
+        "IP_SCRIPTS": render_ip_script_list(staged_rtl["ip_scripts"]),
     }
     template = (
         TEMPLATES

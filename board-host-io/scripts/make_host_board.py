@@ -51,9 +51,9 @@ ASSETS = Path(__file__).resolve().parents[1] / "assets"
 SOURCE_HASHES = {
     "transport_chunked.v": "176da90ff43f50389feb118b24b3ecaa20dd847a49f6ac61a7c29e84d7abece3",
     "transport.v": "d3d613faf1578e8fba0450f1e024ecd0faad1752c17356dad5ab9d99acbdf09e",
-    "uart_rx.v": "f5570b4c8f030694afd778d380b473b6987b7ef1f10e14dbeb762d4d4e3d5965",
-    "uart_tx.v": "f72aa61750168dee3c8c874a8c4edb3aaa2573400a2ce7bea3c68062c4151974",
-    "host_stream_adapter.v": "46595f2c05bc56598d834d2f5fb5f16c68abc829bd052a16aa7592192be58468",
+    "uart_rx.v": "24a87c2a4ec0f6436ffb47311c52ca36f99cbc26fc566cdb34fcaf078b38a04d",
+    "uart_tx.v": "db5ac3472372394876162791d99e96b5653ec10171cecdc0b0f8daf026390e03",
+    "host_stream_adapter.v": "45d357306e90c6f3d9c6ef1feaf43a366f1c972d88c3271d14aa52023d0b3d55",
     "host_avld_adapter.v": "a72944d5e7296f04ee532519af102fd7cdb126a0293f4b1a2e34bb868966e5a2",
 }
 ADAPTER_FOR_MODE = {"parallel": "host_avld_adapter.v", "stream": "host_stream_adapter.v"}

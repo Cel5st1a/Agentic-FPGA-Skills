@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sys
 
 import pytest
 from test_s15_numeric_policy import ROOT
@@ -70,7 +71,7 @@ print('ONNX_CONVERTER_INTEGRATION_PASS')
 def test_actual_onnx_converter_preserves_graph_and_reference(tmp_path, activation):
     result = subprocess.run(
         [
-            "D:/Agentic_FPGA_Deployment/.venv/Scripts/python.exe",
+            os.environ.get("S15_ONNX_TEST_PYTHON", sys.executable),
             "-B",
             "-c",
             PROBE,

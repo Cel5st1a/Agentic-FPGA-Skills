@@ -75,8 +75,10 @@ bash scripts/verify_deployment.sh --serial COM3 --baud 115200
 
 ## Verification Steps
 
-1. **Device detection**: `vivado -mode batch -source scripts/detect_device.tcl` — that script
-   does not exist in this tree; the line never programs a device.
+For AX7A200B Artix-7, use [board-host-io](../board-host-io/SKILL.md) for authorized
+JTAG programming and live UART verification. The steps below apply to Zynq designs.
+
+1. Detect the exact device and programming cable in Vivado.
 2. **Program**: `program_hw_devices [lindex [get_hw_devices] 0]`
 3. **Boot check**: Read serial output, look for "boot done" or custom heartbeat
 4. **Register check**: Read known register values via AXI

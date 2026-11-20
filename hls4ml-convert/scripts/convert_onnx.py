@@ -71,10 +71,15 @@ import yaml
 
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from contract_config import apply_contract_config, firmware_config_audit, original_output_mode
-from pooling_compat import patch_stream_pooling
+from contract_config import (
+    apply_contract_config,
+    firmware_config_audit,
+    original_output_mode,
+    select_backend,
+)
 from generated_compat import configure_softmax_exp_reads
 from numeric_diagnostics import parameter_grid_diagnostics
+from pooling_compat import patch_stream_pooling
 
 SKILL = Path(__file__).resolve().parents[1]
 DEFAULT_TEMPLATE = SKILL / "templates" / "hls4ml_config_template.yaml"
@@ -509,9 +514,7 @@ def main() -> int:
                 f"interior softmax={interior_softmax}"
             )
 
-    backend = (
-        "Vitis" if contract.get("backend") == "hls4ml-vitis" else template.get("Backend", "Vivado")
-    )
+    backend = select_backend(contract, template)
     hls_config = build_hls_config(template, contract, skipped_nodes)
 
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -592,6 +595,7 @@ def main() -> int:
         "path": "B",
         "contract": {"path": str(contract_path), "sha256": sha256_file(contract_path)},
         "template": {"path": str(args.template), "sha256": sha256_file(args.template)},
+        "backend": {"requested": contract.get("backend"), "effective": backend},
         "environment": {
             "python": sys.version.split()[0],
             "interpreter": sys.executable,

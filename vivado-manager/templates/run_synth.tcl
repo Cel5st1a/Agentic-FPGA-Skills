@@ -6,6 +6,9 @@ set_param general.maxThreads {{THREADS}}
 create_project {{PROJECT_NAME}} $root/implementation -part {{PART}} -force
 set files [glob {{RTL_DIR}}/*.v]
 add_files $files
+foreach script [list {{IP_SCRIPTS}}] {
+    source [file join {{RTL_DIR}} $script]
+}
 read_xdc {{XDC}}
 set_property top {{TOP}} [get_filesets sources_1]
 update_compile_order -fileset sources_1

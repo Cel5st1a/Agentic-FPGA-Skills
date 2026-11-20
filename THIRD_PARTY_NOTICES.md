@@ -11,3 +11,7 @@ Vivado, Vitis, hls4ml, TensorFlow, PyTorch, ONNX and other external tools retain
 their respective licenses. This repository contains integration scripts and
 configuration, not distributions of the proprietary EDA tools, licenses or board
 manuals. References to vendors and products do not imply endorsement.
+
+Odatix integration uses the separately installed Odatix 4.0.0 Python package and
+its Workflow and design-space exploration APIs. Odatix itself is not vendored
+or relicensed by this repository.

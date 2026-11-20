@@ -30,7 +30,7 @@ from line.geometry import sample_rows  # noqa: E402
 from line.run_line import Lock  # noqa: E402
 from protocol import decode_response, encode_request  # noqa: E402
 from run_board_sim import DEFAULT_VIVADO, run_tool  # noqa: E402
-from stage_rtl import stage_rtl  # noqa: E402
+from stage_rtl import render_ip_script_list, stage_rtl  # noqa: E402
 
 
 def sha256_file(path: Path) -> str:
@@ -221,7 +221,7 @@ def simulate(deployment: Path, board: Path, output: Path, vivado: Path = DEFAULT
         raise ValueError("model changed after host board generation")
 
     contract = yaml.safe_load(deployment.read_text(encoding="utf-8-sig"))
-    criterion = simulation_criterion()
+    criterion = simulation_criterion(contract)
     # Same helper, same inputs as make_host_board.py and verify_board.py: the builder and the
     # verifier cannot disagree about the frame, including the baudrate from the board profile.
     geometry = geometry_for_wrapper(deployment, contract, wrapper)
@@ -293,6 +293,7 @@ def simulate(deployment: Path, board: Path, output: Path, vivado: Path = DEFAULT
         "RTL_DIR": rtl.as_posix(),
         "XDC": (rtl / "board.xdc").as_posix(),
         "SIM_RUN_TCL": hook.as_posix(),
+        "IP_SCRIPTS": render_ip_script_list(staged["ip_scripts"]),
     }
     script = board / "host_simulate.tcl"
     content = template.read_text(encoding="utf-8")

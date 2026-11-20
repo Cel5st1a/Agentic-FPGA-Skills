@@ -314,18 +314,19 @@ def search(deployment, output, layer, role, candidates, *, compiler, trace_layer
     import convert_keras as converter
     import hls4ml
     import numpy as np
-    from contract_config import original_output_mode
+    from contract_config import original_output_mode, select_backend
     from numeric_diagnostics import parameter_grid_diagnostics
 
     contract = converter.read_yaml(deployment)
     if role not in PRECISION_ROLES or contract.get("io_type") != "io_parallel":
         raise ValueError("supports listed local precision roles and io_parallel only")
-    if contract["model"].get("frontend") not in (
+    frontend = converter.model_frontend(contract["model"])
+    if frontend not in (
         converter.KERAS_FILE_FRONTENDS | converter.KERAS_JSON_FRONTENDS
     ):
         raise ValueError("supports Keras file and JSON with original associated weights only")
     quantized = bool(contract["model"].get("quantized")) or (
-        contract["model"].get("frontend") == "qkeras_json_weights"
+        frontend == "qkeras_json_weights"
     )
     if quantized and role in {"weight", "bias", "result"}:
         raise ValueError("quantized model weight, bias and result quantizers must remain original")
@@ -398,9 +399,7 @@ def search(deployment, output, layer, role, candidates, *, compiler, trace_layer
                     part=converter.board_part(deployment, contract),
                     clock_period=float(config["clock_period_ns"]),
                     io_type="io_parallel",
-                    backend="Vitis"
-                    if config.get("backend") == "hls4ml-vitis"
-                    else template.get("Backend", "Vivado"),
+                    backend=select_backend(config, template),
                 )
                 output_grid = (
                     converter.pin_output_grid(graph, config["precision"]) if quantized else None

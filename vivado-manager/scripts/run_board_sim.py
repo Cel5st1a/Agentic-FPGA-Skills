@@ -19,10 +19,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
 
-import sys
 import yaml
 
 LINE_SCRIPTS = Path(__file__).resolve().parents[2] / "scripts"
@@ -34,7 +34,7 @@ from line.evidence import compare  # noqa: E402
 from line.identity import identity_fields  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from stage_rtl import stage_rtl  # noqa: E402
+from stage_rtl import render_ip_script_list, stage_rtl  # noqa: E402
 
 TEMPLATES = Path(__file__).resolve().parents[1] / "templates"
 DEFAULT_VIVADO = Path(r"D:\vitis\2025.2\Vivado\bin\vivado.bat")
@@ -160,7 +160,6 @@ def main() -> int:
     )
     values["SIM_RUN_TCL"] = sim_run.as_posix()
     script = board / "simulate.tcl"
-    script.write_text(render(TEMPLATES / "simulate.tcl", values), encoding="utf-8")
 
     # A stale result file from an earlier run must never be read as this run's output.
     for stale in board.rglob("board_results.log"):
@@ -170,10 +169,15 @@ def main() -> int:
     # earlier synthesis run having left it behind: that dependency made the first board
     # simulation of a fresh design fail with "no files matched glob .../rtl/*.v".
     staged_rtl = stage_rtl(board, wrapper)
+    values["IP_SCRIPTS"] = render_ip_script_list(staged_rtl["ip_scripts"])
+    script.write_text(render(TEMPLATES / "simulate.tcl", values), encoding="utf-8")
 
     execution = run_tool(args.vivado, script, args.work.resolve(), args.timeout)
     evidence: dict = {
-        **(identity_fields(args.deployment, (wrapper.get("board") or {}).get("pins_profile")) if args.deployment else {}),
+        **(
+            identity_fields(args.deployment, (wrapper.get("board") or {}).get("pins_profile"))
+            if args.deployment else {}
+        ),
         "schema_version": 1,
         "stage": "board_sim",
         "skill": "vivado-manager",
@@ -287,14 +291,20 @@ def main() -> int:
             evidence.setdefault("reasons", []).append("board gate: " + detail)
 
     args.evidence.resolve().parent.mkdir(parents=True, exist_ok=True)
-    args.evidence.resolve().write_text(json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8")
+    args.evidence.resolve().write_text(
+        json.dumps(evidence, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    board_gate = evidence.get("board_gate")
+    gate_fields = (
+        "passed", "values", "max_abs_error", "max_error_over_tolerance", "bit_exact_on_the_grid"
+    )
     summary = {
         "stage": evidence["stage"], "status": evidence["status"],
         "returncode": execution["returncode"], "duration_s": execution["duration_s"],
-        "board_gate": {k: evidence["board_gate"][k]
-                       for k in ("passed", "values", "max_abs_error", "max_error_over_tolerance",
-                                 "bit_exact_on_the_grid")
-                       if k in evidence.get("board_gate", {})} if "board_gate" in evidence else None,
+        "board_gate": (
+            {key: board_gate[key] for key in gate_fields if key in board_gate}
+            if board_gate is not None else None
+        ),
         "reasons": evidence.get("reasons"),
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))

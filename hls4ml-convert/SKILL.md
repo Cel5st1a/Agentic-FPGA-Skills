@@ -106,6 +106,10 @@ missing script, so this gap fails loudly instead of half-way through a run.
 
 ## Configuration Template
 
+AX7A200B 使用 Vitis HLS 工作流时，契约可写 `backend: Vitis` 或 `backend: hls4ml-vitis`。
+转换证据记录 `backend.requested` 和 `backend.effective`，生成工程的
+`hls4ml_config.yml` 记录实际后端。选择 `io_stream` 后可核对实际使用的卷积模板。
+
 转换器同时合并契约 `hls_config` 的 `Model/LayerName/LayerType`；null 视为未设置，冲突的全局/逐层 RF、全局精度、Strategy 或 softmax skip 必须失败。`configuration_audit` 记录请求、传给 hls4ml 的配置、生成参数与类型及其哈希。对 hls4ml 1.3.0，`TableType` 保留并告警，真正决定 table typedef 的键是 `Table_t`；不得静默替换冻结字段。
 
 QKeras 保留内部量化，只固定解析后的最终 HLS 图输出到契约网格。使用 exponential product 的新工程自动执行已验证的 hls4ml 1.3.0 po2 乘积位宽修复；补丁只写工程副本，版本/模板哈希未知即拒绝。证据包含 `output_grid_pin` 与 `compatibility_repairs`。可选C++诊断须比较完整原输出；不把CSim作为额外板端验收门槛。
@@ -204,3 +208,7 @@ Do not treat this convenience as replacing real board numerical acceptance.
 ## Opt4 streaming pooling compatibility
 Keras conversion with hls4ml 1.3.0 and the Vitis backend installs a hash-checked generated-project repair. Supported 2x2 stride-2 unpadded MaxPooling2D with one complete channel vector per stream packet uses explicit indexed row storage. Other geometries retain the stock function. The conversion evidence records the repair. No model or weight files are patched.
 If CSim passes while RTL differs, compare tensors across the earliest pooling boundary before broad precision/RF searches. Reuse existing captures. Confirm the first differing layer and preserve failed attempts.
+
+### Parallel Dense designs with excessive estimated area
+
+For a Vitis hls4ml 1.3.0 io_parallel Dense/ReLU design, inspect the generated top PIPELINE directive if the effective reuse factors agree with the contract but the estimated resources are unexpectedly large. An isolated candidate can set top_schedule: sequential and keep the same explicit PipelineStyle: pipeline generation setting. The conversion records the removal of the recognized top directive, including before and after hashes. Preserve the model, weights, numeric formats, RF, layer directives and original-output check. Scope the conclusion to the tested model and tool versions.

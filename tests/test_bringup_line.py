@@ -107,11 +107,17 @@ def test_bootstrap_records_selected_skills_in_all_commands_and_board_digest(tmp_
         assert (
             str(skills / relative) in instructions or (skills / relative).as_posix() in instructions
         )
+    assert "--stages convert,csynth,wrapper" in instructions
+    assert instructions.index("make_host_board.py") < instructions.index("build_host.py")
+    assert instructions.index("build_host.py") < instructions.index("verify_board.py")
 
 
 def test_bootstrap_default_is_its_own_tree_and_board_hash_distinguishes_same_contract(tmp_path):
     frozen = skills_copy(tmp_path)
     shutil.copytree(LINE, frozen / "scripts/line", ignore=shutil.ignore_patterns("__pycache__"))
+    config = Path("hls4ml-convert/scripts/contract_config.py")
+    (frozen / config.parent).mkdir(parents=True)
+    shutil.copy2(ROOT / config, frozen / config)
     states = []
     for board in ("NexysVideo", "AX7A200B"):
         deployment = fixture_contract(tmp_path / board, board)

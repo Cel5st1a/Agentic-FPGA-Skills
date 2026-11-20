@@ -126,3 +126,53 @@ def test_patch_stock_template_idempotent(tmp_path):
     raw = target.read_bytes()
     assert patch_stream_pooling(tmp_path, "1.3.0", "Vitis")["status"] == "ALREADY_APPLIED"
     assert target.read_bytes() == raw
+
+def test_keras_converter_records_the_first_pooling_patch_outcome():
+    import ast
+
+    converter = ROOT / "hls4ml-convert/scripts/convert_keras.py"
+    module = ast.parse(converter.read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(module)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "patch_stream_pooling"
+    ]
+    assert len(calls) == 1, "a second patch call hides the APPLIED record and before hash"
+
+def test_vitis_generated_script_already_sources_options(tmp_path):
+    import importlib.util
+
+    source = ROOT / "vitis-build-agent/scripts/run_stage.py"
+    spec = importlib.util.spec_from_file_location("vitis_generated_options", source)
+    runner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner)
+    script = tmp_path / "build_prj.tcl"
+    script_text = (
+        "set tcldir [file dirname [info script]]\n"
+        "source [file join $tcldir project.tcl]\n"
+        "source [file join $tcldir build_opt.tcl]\n"
+    )
+    script.write_text(script_text, encoding="utf-8")
+    runner.write_options(tmp_path, runner.STAGE_FLAGS["csynth"])
+    evidence = runner.bind_stage_options(tmp_path)
+    assert evidence["status"] == "BOUND"
+    assert script.read_text(encoding="utf-8") == script_text
+
+def test_sequential_dense_repair_only_removes_top_pipeline(tmp_path):
+    from generated_compat import sequential_dense_top
+
+    firmware = tmp_path / "firmware"
+    firmware.mkdir()
+    target = firmware / "myproject.cpp"
+    raw = (
+        b'void myproject() {\r\n    #pragma HLS PIPELINE\r\n    dense_call();\r\n}\r\n'
+        b'void layer_helper() {\r\n    #pragma HLS PIPELINE\r\n    mac();\r\n}\r\n'
+    )
+    target.write_bytes(raw)
+    info = sequential_dense_top(tmp_path, "1.3.0", "Vitis", "io_parallel", "myproject")
+    assert info["status"] == "APPLIED"
+    assert target.read_bytes() == raw.replace(b"    #pragma HLS PIPELINE\r\n", b"", 1)
+    assert info["before_sha256"] != info["after_sha256"]
+    assert info["hardware_verified"] is False

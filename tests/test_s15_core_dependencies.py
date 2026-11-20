@@ -81,6 +81,33 @@ def test_legacy_record_is_explicitly_unrecorded(tmp_path):
     assert result["core_manifest_verification"] == "UNRECORDED_LEGACY"
 
 
+def test_stages_explicitly_paired_ip_tcl_and_invalidates_when_it_changes(tmp_path):
+    mod, core, board, wrapper = fixture(tmp_path)
+    (core.parent / "arithmetic.v").write_text(
+        "module arithmetic;\n  arithmetic_ip instance_name (\n  );\nendmodule"
+    )
+    ip = core.parent / "arithmetic_ip.tcl"
+    ip.write_text("# Vitis output")
+    (core.parent / "other_ip.tcl").write_text("# unrelated")
+    wrapper["core_source_manifest"] = mod.core_sources(core)
+    result = mod.stage_rtl(board, wrapper)
+    assert result["ip_scripts"] == ["arithmetic_ip.tcl"]
+    assert "arithmetic_ip.tcl" in result["dependency_scopes"]["core"]
+    assert not (board / "rtl/other_ip.tcl").exists()
+    ip.write_text("# updated Vitis output")
+    with pytest.raises(ValueError, match="core source manifest"):
+        mod.stage_rtl(board, wrapper)
+
+
+def test_board_sim_template_loads_paired_ip_before_launch(tmp_path):
+    mod, _, _, _ = fixture(tmp_path)
+    assert mod.render_ip_script_list(["generated_ip.tcl"]) == "{generated_ip.tcl}"
+    simulator = load("vivado-manager/scripts/run_board_sim.py", "paired_ip_sim")
+    template = (simulator.TEMPLATES / "simulate.tcl").read_text(encoding="utf-8")
+    assert template.index("{{IP_SCRIPTS}}") < template.index("launch_simulation")
+    assert "source [file join {{RTL_DIR}} $script]" in template
+
+
 def test_host_generator_records_complete_core_bundle(tmp_path):
     import sys
 
@@ -88,6 +115,9 @@ def test_host_generator_records_complete_core_bundle(tmp_path):
 
     sys.path.insert(0, str(ROOT / "board-host-io/tests"))
     from test_board_host_io import MLP_WRAPPER
+
+    if not MLP_WRAPPER.is_file():
+        pytest.skip("optional historical MLP wrapper fixture is unavailable")
 
     gen = load("board-host-io/scripts/make_host_board.py", "dependency_host_gen")
     record = gen.generate(MLP_WRAPPER, tmp_path / "host")

@@ -181,3 +181,7 @@ Estimated fix time: 5-10 min.
 - hls4ml PyTorch backend warnings about "Failed to import handlers" are normal
 - TensorBoard deprecation warnings in TF 2.13 are benign
 - oneAPI warning messages differ from Vivado; separate parser needed
+
+## Odatix batch evidence
+
+Read the batch-result.json summary alongside each producing candidate log. Record aliases as reused work with the producer ID, and count actual jobs separately from requests. A zero Odatix exit code does not establish per-task success.

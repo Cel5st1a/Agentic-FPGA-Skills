@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 SKILLS = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(SKILLS / "scripts"))
@@ -255,6 +257,73 @@ def build(
         ]
 
 
+def build_with_odatix(
+    deployment,
+    board,
+    python,
+    odatix,
+    output,
+    *,
+    start_stage="synth",
+    prior_evidence=None,
+    continuation_board=None,
+):
+    """Wrap the existing host build while keeping its run-local evidence and lock."""
+    from tempfile import TemporaryDirectory
+
+    from odatix_batch import run_batch, write_json
+
+    output = Path(output).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    interpreter = shutil.which(str(python))
+    if interpreter is None:
+        raise FileNotFoundError(f"host build interpreter not found: {python}")
+    interpreter = str(Path(interpreter).resolve())
+    command = [
+        interpreter,
+        str(Path(__file__).resolve()),
+        "--deployment",
+        str(Path(deployment).resolve()),
+        "--board",
+        str(Path(board).resolve()),
+        "--python",
+        interpreter,
+        "--start-stage",
+        start_stage,
+    ]
+    if prior_evidence is not None:
+        command += ["--prior-evidence", str(Path(prior_evidence).resolve())]
+    if continuation_board is not None:
+        command += ["--continuation-board", str(Path(continuation_board).resolve())]
+    with TemporaryDirectory(prefix="host-batch-", dir=output.parent) as temporary:
+        payload = Path(temporary)
+        write_json(payload / "command.json", command)
+        (payload / "invoke.py").write_text(
+            "import json\nimport os\nfrom pathlib import Path\nimport subprocess\n"
+            "command = json.loads(Path('command.json').read_text(encoding='utf-8'))\n"
+            "subprocess.run(command, check=True, env={**os.environ, 'S15_ODATIX_WORKER': '1'})\n"
+            "Path('host-build-complete.json').write_text('{\"completed\": true}')\n",
+            encoding="utf-8",
+        )
+        return run_batch(
+            {
+                "entrypoint": "invoke.py",
+                "expected_outputs": ["host-build-complete.json"],
+                "candidates": [{"id": "host-build", "args": [], "independent": True}],
+            },
+            payload,
+            output,
+            odatix,
+        )
+
+
+def workflow_default(board: Path) -> tuple[Path | None, Path | None]:
+    executable = os.environ.get("S15_ODATIX_EXE")
+    if not executable or os.environ.get("S15_ODATIX_WORKER") == "1":
+        return None, None
+    return Path(executable), board.resolve() / f"odatix-{uuid4().hex[:12]}"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployment", type=Path, required=True)
@@ -263,7 +332,26 @@ def main() -> int:
     parser.add_argument("--start-stage", choices=STAGES, default="synth")
     parser.add_argument("--prior-evidence", type=Path)
     parser.add_argument("--continuation-board", type=Path)
+    parser.add_argument("--odatix", type=Path, help="optional Odatix 4.0 executable")
+    parser.add_argument("--odatix-output", type=Path, help="fresh Odatix workspace directory")
     args = parser.parse_args()
+    if (args.odatix is None) != (args.odatix_output is None):
+        parser.error("--odatix and --odatix-output must be supplied together")
+    if args.odatix is None:
+        args.odatix, args.odatix_output = workflow_default(args.board)
+    if args.odatix is not None:
+        batch = build_with_odatix(
+            args.deployment,
+            args.board,
+            args.python,
+            args.odatix,
+            args.odatix_output,
+            start_stage=args.start_stage,
+            prior_evidence=args.prior_evidence,
+            continuation_board=args.continuation_board,
+        )
+        print(json.dumps(batch, indent=2))
+        return 0 if batch["status"] == "success" else 1
     results = build(
         args.deployment,
         args.board,

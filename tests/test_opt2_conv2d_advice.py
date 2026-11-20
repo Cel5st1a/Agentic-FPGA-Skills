@@ -1,12 +1,17 @@
 import os
 from pathlib import Path
 
+import pytest
+
 from test_s15_numeric_policy import load
 
 
 def development_header():
     root = Path(os.environ.get("S15_DEVELOPMENT_EVIDENCE", Path(__file__).parents[2] / "evidence"))
-    return root / "20261026-07/p2-convert/project/firmware/parameters.h"
+    header = root / "20261026-07/p2-convert/project/firmware/parameters.h"
+    if not header.is_file():
+        pytest.skip("optional 20261026 archived conversion fixture is unavailable")
+    return header
 
 
 def tool():

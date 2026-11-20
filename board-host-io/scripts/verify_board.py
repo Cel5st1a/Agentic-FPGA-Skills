@@ -458,7 +458,7 @@ def capture(
     return summary
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--deployment", type=Path, required=True)
     parser.add_argument("--board", type=Path, required=True)
@@ -473,7 +473,7 @@ def main() -> int:
     )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout-s", type=float, default=2.0)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     summary = capture(
         args.deployment,
         args.board,

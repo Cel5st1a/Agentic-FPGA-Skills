@@ -424,9 +424,13 @@ def reference_rows_from_deployment(deployment, contract: dict):
     entry = (contract.get("verification") or {}).get("references")
     if not entry:
         return None
-    path = (Path(deployment).parent / entry).resolve()
+    deployment = Path(deployment).resolve()
+    path = (deployment.parent / entry).resolve()
     if not path.is_file():
-        _fail("verification.references", "existing reference file", str(path))
+        generated = deployment.parents[2] / "evidence/python-output.json"
+        if not generated.is_file():
+            _fail("verification.references", "declared or generated reference file", str(path))
+        path = generated
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 

@@ -117,6 +117,22 @@ def bind_stage_options(project: Path) -> dict:
         return {"status": "UNKNOWN", "reason": "no generated build script"}
     text = script.read_text(encoding="utf-8")
     blocks = list(re.finditer(r"array\s+set\s+opt\s*\{[^{}]*\}", text))
+    source_line = "source [file join $tcldir build_opt.tcl]"
+    lines = [line.strip() for line in text.splitlines()]
+    tcldir_line = "set tcldir [file dirname [info script]]"
+    if (
+        not blocks
+        and lines.count(tcldir_line) >= 1
+        and lines.count(source_line) == 1
+        and lines.index(tcldir_line) < lines.index(source_line)
+        and (project / "build_opt.tcl").is_file()
+    ):
+        return {
+            "status": "BOUND",
+            "source": source_line,
+            "build_prj_sha256": sha256_file(script),
+            "build_opt_sha256": sha256_file(project / "build_opt.tcl"),
+        }
     if len(blocks) != 1:
         return {"status": "UNKNOWN", "reason": "unrecognized generated option block"}
     end = blocks[0].end()

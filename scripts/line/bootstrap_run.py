@@ -32,7 +32,7 @@ import yaml
 # that names the wrong interpreter is followed literally by a memoryless agent. Importing
 # the one implementation is how they stay in agreement.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from run_line import detect_keras_major, board_pin_profile  # noqa: E402
+from run_line import board_pin_profile, model_frontend, resolve_interpreter  # noqa: E402
 
 SKILLS = Path(__file__).resolve().parents[2]
 DEFAULT_ROOT = Path(r"D:\ML_models\_line\runs")
@@ -61,8 +61,11 @@ def main() -> int:
     parser.add_argument("--run", required=True, help="run id, e.g. 20260927-01")
     parser.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     parser.add_argument("--skills", type=Path, default=SKILLS)
-    parser.add_argument("--model-id", default=None,
-                        help="directory under <root> that holds the run (defaults to the contract package name)")
+    parser.add_argument(
+        "--model-id",
+        default=None,
+        help="directory under <root> that holds the run (defaults to the contract package name)",
+    )
     parser.add_argument(
         "--with-shared-assets",
         default=True,
@@ -75,6 +78,8 @@ def main() -> int:
     contract_dir = contract_path.parent
     package_root = contract_dir.parent
     contract = read_contract(contract_path)
+    model = contract["model"]
+    frontend = model_frontend(model)
 
     model_id = args.model_id or contract_dir.name
     run_dir = (args.root / model_id / args.run).resolve()
@@ -95,7 +100,15 @@ def main() -> int:
             shutil.copytree(shared, run_dir / "contract" / "public")
             shared_copied = "public"
 
-    for stage in ("p1-env", "p2-convert", "p3-build", "p4-analysis", "p5-package", "evidence", "logs"):
+    for stage in (
+        "p1-env",
+        "p2-convert",
+        "p3-build",
+        "p4-analysis",
+        "p5-package",
+        "evidence",
+        "logs",
+    ):
         (run_dir / stage).mkdir()
 
     model_files = {}
@@ -140,7 +153,8 @@ def main() -> int:
         "original_contract_path": str(contract_path),
         "contract_path_in_run": str(relocated_contract),
         "contract_sha256": sha256_file(relocated_contract),
-        "contract_byte_identical_to_source": sha256_file(relocated_contract) == sha256_file(contract_path),
+        "contract_byte_identical_to_source": sha256_file(relocated_contract)
+        == sha256_file(contract_path),
         "package_dir_in_run": str(contract_copy_dir),
         "shared_assets_copied": shared_copied,
         "model_files": model_files,
@@ -149,7 +163,10 @@ def main() -> int:
         "skills_root": str(skills),
         "board_profile_sha256": sha256_file(resolved) if board_profile_record else None,
         "board_pins_profile_sha256": sha256_file(
-            board_pin_profile(contract, relocated_contract, skills)) if board_profile_record else None,
+            board_pin_profile(contract, relocated_contract, skills)
+        )
+        if board_profile_record
+        else None,
         "deployment_parameters": {
             key: contract.get(key)
             for key in (
@@ -175,9 +192,9 @@ def main() -> int:
         for phase, names in (
             (1, ("fpga-env-audit", "compatibility-checker")),
             (2, ("tensorflow-to-fpga", "hls4ml-convert")),
-            (3, ("vitis-build-agent", "vivado-manager")),
+            (3, ("vitis-build-agent", "vivado-manager", "board-host-io")),
             (4, ("resource-estimator", "timing-closure-debugger", "log-analyzer")),
-            (5, ("bitstream-package", "workflow-memory", "zynq-deploy (NOT run: no flashing)")),
+            (5, ("board-host-io", "bitstream-package", "workflow-memory")),
         )
     )
     contract_rel = relocated_contract.relative_to(run_dir).as_posix()
@@ -186,31 +203,22 @@ def main() -> int:
     # archive the *interpreter* additionally depends on the archive's own Keras major
     # version -- a Keras 3 container cannot be deserialised by Keras 2.13 (defect D-N01) --
     # so it is resolved from the model file rather than assumed from the frontend. `run_line.py`
-    # does the same, and `--python` overrides both.
-    frontend = (contract.get("model") or {}).get("frontend")
-    keras_major = None
-    model_rel = (contract.get("model") or {}).get("path")
-    if model_rel:
-        keras_major = detect_keras_major((contract_copy_dir / model_rel).resolve())
-    keras3_python = r"D:\Agentic_FPGA_Deployment - 副本\.venv\Scripts\python.exe"
-    legacy_python = r"D:\python_envs\hls4ml_conv\Scripts\python.exe"
+    # does the same by default and accepts an explicit `--python` override.
     conversion_env = {
-        "keras_json_weights": (legacy_python, "convert_keras.py", "Path A (Keras)"),
-        "qkeras_json_weights": (legacy_python, "convert_keras.py", "Path A (QKeras)"),
-        "keras_h5": (legacy_python, "convert_keras.py", "Path A (Keras .h5)"),
-        "keras_archive": (legacy_python, "convert_keras.py", "Path A (Keras archive)"),
-        "onnx": (r"D:\Agentic_FPGA_Deployment - 副本\.venv\Scripts\python.exe", "convert_onnx.py", "Path B (ONNX)"),
+        "keras_json_weights": ("convert_keras.py", "Path A (Keras)"),
+        "qkeras_json_weights": ("convert_keras.py", "Path A (QKeras)"),
+        "keras_h5": ("convert_keras.py", "Path A (Keras .h5)"),
+        "keras_archive": ("convert_keras.py", "Path A (Keras archive)"),
+        "onnx": ("convert_onnx.py", "Path B (ONNX)"),
     }
     if frontend in conversion_env:
-        converter_python, converter_script, path_label = conversion_env[frontend]
-        if frontend in {"keras_archive", "keras_h5"} and keras_major == 3:
-            converter_python = keras3_python
-            path_label += ", Keras 3 archive -> Keras 3 env"
+        converter_script, path_label = conversion_env[frontend]
+        converter_python = resolve_interpreter(contract, contract_copy_dir / model["path"])
         conversion_block = (
             f"# P2 - conversion (hls4ml-convert {path_label}, frontend `{frontend}`)\n"
-            f"& \"{converter_python}\" `\n"
+            f'& "{converter_python}" `\n'
             f'  "{skills / "hls4ml-convert" / "scripts" / converter_script}" `\n'
-            "  --deployment $contract --output (Join-Path $run \"p2-convert\\project\")"
+            '  --deployment $contract --output (Join-Path $run "p2-convert\\project")'
         )
     else:
         conversion_block = (
@@ -228,16 +236,16 @@ memoryless agent starts from the same inputs every time. `RUN.md` and
 
 | item | value |
 | --- | --- |
-| contract in run | `{contract_rel}` (sha256 `{starting_state['contract_sha256']}`) |
-| package dir in run | `{starting_state['package_dir_in_run'].split('runs')[-1].lstrip(chr(92))}` |
+| contract in run | `{contract_rel}` (sha256 `{starting_state["contract_sha256"]}`) |
+| package dir in run | `{starting_state["package_dir_in_run"].split("runs")[-1].lstrip(chr(92))}` |
 | skills root | `{skills}` |
 | model frontend | `{frontend}` |
-| precision | `{contract.get('precision')}` |
-| reuse_factor | `{contract.get('reuse_factor')}` |
-| io_type / strategy | `{contract.get('io_type')}` / `{contract.get('strategy')}` |
-| clock_period_ns | `{contract.get('clock_period_ns')}` |
+| precision | `{contract.get("precision")}` |
+| reuse_factor | `{contract.get("reuse_factor")}` |
+| io_type / strategy | `{contract.get("io_type")}` / `{contract.get("strategy")}` |
+| clock_period_ns | `{contract.get("clock_period_ns")}` |
 
-## Stage order (13 skills)
+## Deployment stages
 
 See `{skills}\\ORDER.md` for the full order, the frozen criterion and the stage list.
 
@@ -245,11 +253,54 @@ See `{skills}\\ORDER.md` for the full order, the frozen criterion and the stage 
 | --- | --- |
 {skill_layout}
 
-## Commands (fresh shell, absolute paths only)
+## UART deployment
+
+Set $py to the conversion environment for the contract frontend. For authorized
+hardware tasks, use the observed USB bridge port and JTAG cable for the board.
+
+For a fresh UART deployment, start the hardware server and use the observed $port.
+See {skills / "board-host-io/SKILL.md"} for the board and cable checks.
+
+```powershell
+& $py "{skills / "scripts/line/run_uart.py"}" `
+  --deployment "{relocated_contract}" --run "{run_dir}" --python $py --port $port
+```
+
+Use the individual stages below to inspect or resume a failed attempt.
 
 ```powershell
 $run = "{run_dir}"
-$contract = Join-Path $run "{contract_rel.replace('/', chr(92))}"
+$contract = Join-Path $run "{contract_rel.replace("/", chr(92))}"
+$hostTools = "{skills / "board-host-io/scripts"}"
+$board = Join-Path $run "p3-build/host-board"
+$audit = Join-Path $run "evidence/host-port-audit"
+$bit = Join-Path $board "board_top.bit"
+
+& $py "{skills / "scripts/line/run_line.py"}" `
+  --deployment $contract --run $run --skills "{skills}" --python $py `
+  --stages convert,csynth,wrapper
+& $py "$hostTools/make_host_board.py" `
+  --source-wrapper "$run/p3-build/board/wrapper.json" --output $board
+& $py "$hostTools/build_host.py" --deployment $contract --board $board --python $py
+& $py "$hostTools/audit_ports.py" --wrapper "$board/wrapper.json" `
+  --routed-dcp "$board/routed.dcp" --output $audit
+```
+
+Start the hardware server and set the observed $cable and $port using
+{skills / "board-host-io/SKILL.md"}. Check each step before proceeding.
+
+```powershell
+& $py "$hostTools/program_jtag.py" --bitstream $bit --io-scope "$audit/io-scope.json" `
+  --bitstream-evidence "$run/evidence/host-vivado-bitstream-evidence.json" `
+  --output "$run/hardware-program" --cable-serial $cable
+& $py "$hostTools/verify_board.py" --deployment $contract --board $board --bitstream $bit `
+  --io-scope "$audit/io-scope.json" --program-summary "$run/hardware-program/summary.json" `
+  --port $port --output "$run/hardware-validation"
+```
+
+## Targeted diagnostics
+
+```powershell
 
 # P1 - environment audit (the skills' own scripts)
 bash "{(skills / "fpga-env-audit/scripts/audit_system.sh").as_posix()}"
@@ -258,31 +309,38 @@ bash "{(skills / "compatibility-checker/scripts/check_compat.sh").as_posix()}"
 
 {conversion_block}
 
-# P3-P5 - drive the rest of the line (stages are checked against their evidence)
-& D:\\python_envs\\hls4ml_conv\\Scripts\\python.exe `
-  "{skills / "scripts/line/run_line.py"}" `
-  --deployment $contract --run $run --skills "{skills}" `
-  --stages csim,csynth,wrapper,boardsim,synth,impl,bitstream,ports,package
 ```
 
 ## Evidence contract
 
 Every stage writes evidence JSON under `evidence/` and raw logs under `logs/`.
-A stage that produced no evidence is `NOT_RUN`, never `PASSED`.
-No programming, no on-board inference.
+The original UART capture and `hardware-validation/summary.json` record the
+result against the original-model Python reference for all supplied inputs.
 """,
         encoding="utf-8",
     )
 
-    print(json.dumps({
-        "run_dir": str(run_dir),
-        "contract_in_run": str(relocated_contract),
-        "contract_sha256": starting_state["contract_sha256"],
-        "contract_byte_identical_to_source": starting_state["contract_byte_identical_to_source"],
-        "board_profile_resolves": bool(board_profile_record and board_profile_record["resolves_inside_run"]),
-        "missing_verification_files": [k for k, v in verification_files.items() if v.get("missing")],
-        "deployment_parameters": starting_state["deployment_parameters"],
-    }, indent=2, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "contract_in_run": str(relocated_contract),
+                "contract_sha256": starting_state["contract_sha256"],
+                "contract_byte_identical_to_source": starting_state[
+                    "contract_byte_identical_to_source"
+                ],
+                "board_profile_resolves": bool(
+                    board_profile_record and board_profile_record["resolves_inside_run"]
+                ),
+                "missing_verification_files": [
+                    k for k, v in verification_files.items() if v.get("missing")
+                ],
+                "deployment_parameters": starting_state["deployment_parameters"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     return 0
 
 

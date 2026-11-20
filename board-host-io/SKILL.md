@@ -212,3 +212,13 @@ and is re-raised. A hard process stop leaves the initial incomplete, failed reco
 PASS. Keep every attempt directory. Supply a fresh `--output` path for a subsequent attempt;
 existing directories, including old directories with no summary, are never overwritten.
 For capture, a new path does not waive the configure → probe → capture procedure above.
+
+### Odatix execution option
+
+When the task explicitly requests Odatix, add --odatix <odatix.exe> and --odatix-output <fresh-directory> to build_host.py. The job calls the same host build and retains the same evidence, EDA lock, and checkpoint continuation rules. Read the batch log and the run-local build evidence together. This path uses run-local external inputs and always runs independently.
+
+## Workflow-enabled host builds
+
+When the deployment environment sets S15_ODATIX_EXE, the usual build_host.py command runs through Odatix and writes a fresh batch record under the host-board attempt. Use the batch and the existing stage evidence together. The board programming and numeric verification commands follow their existing evidence rules.
+
+For a UART deployment, once HLS produces a compatible core and the host wrapper is available, build that wrapper directly with build_host.py. Run a ROM-only implementation when the task requires it. On failure, use the stage report and continue from the verified checkpoint of the same attempt where applicable. Read [Odatix candidate batches](../docs/odatix-candidate-batches.md) for the runtime and result format.

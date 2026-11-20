@@ -8,14 +8,20 @@ import pytest
 from test_s15_numeric_policy import ROOT
 
 
-@pytest.mark.parametrize("activation", ["softmax", "sigmoid"])
-def test_converter_keeps_original_activation_and_python_reference(tmp_path, activation):
+@pytest.mark.parametrize(
+    ("activation", "backend", "expected_backend"),
+    [("softmax", "Vitis", "Vitis"), ("sigmoid", "", "Vivado")],
+)
+def test_converter_keeps_original_activation_and_python_reference(
+    tmp_path, activation, backend, expected_backend
+):
     probe = """import json,sys
 from pathlib import Path
 import numpy as np
 import tensorflow as tf
 import yaml
-root, work, activation = Path(sys.argv[1]), Path(sys.argv[2]), sys.argv[3]
+root, work = Path(sys.argv[1]), Path(sys.argv[2])
+activation, backend, expected_backend = sys.argv[3:]
 sys.path.insert(0, str(root/'hls4ml-convert/scripts'))
 import convert_keras
 model=tf.keras.Sequential([tf.keras.layers.Input(shape=(2,),name='features'),
@@ -31,10 +37,14 @@ contract={'model':{'path':'original.h5','frontend':'keras_h5','input_shape':[2,2
     'board_profile':'board.yaml','precision':'ap_fixed<24,6>','reuse_factor':1,
     'strategy':'Resource','io_type':'io_parallel','clock_period_ns':10,
     'verification':{'inputs':'inputs.json'}}
+if backend:
+    contract['backend']=backend
 (work/'deployment.yaml').write_text(yaml.safe_dump(contract))
 sys.argv=['convert_keras','--deployment',str(work/'deployment.yaml'),
           '--output',str(work/'project'),'--evidence',str(work/'conversion.json')]
 assert convert_keras.main()==0
+effective=yaml.load((work/'project/hls4ml_config.yml').read_text(), Loader=yaml.BaseLoader)
+assert effective['Backend']==expected_backend, effective['Backend']
 record=json.loads((work/'conversion.json').read_text())
 actual=np.asarray(json.loads((work/'python-output.json').read_text()),dtype=np.float32)
 np.testing.assert_array_equal(actual,expected)
@@ -56,6 +66,8 @@ print('TOY_CONVERTER_INTEGRATION_PASS')
             str(ROOT),
             str(tmp_path),
             activation,
+            backend,
+            expected_backend,
         ],
         capture_output=True,
         text=True,
@@ -68,5 +80,6 @@ print('TOY_CONVERTER_INTEGRATION_PASS')
     assert result.returncode == 0, result.stdout + result.stderr
     assert "TOY_CONVERTER_INTEGRATION_PASS" in result.stdout
     record = json.loads((tmp_path / "conversion.json").read_text())
+    assert record["backend"] == {"requested": backend or None, "effective": expected_backend}
     assert record["gate_quantity"]["skipped_hls4ml_nodes"] == []
     assert record["gate_quantity"]["declared"] == "auto"

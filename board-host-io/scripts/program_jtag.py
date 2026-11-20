@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+from contextlib import ExitStack
 from pathlib import Path
 
 SKILLS = Path(__file__).resolve().parents[2]
@@ -187,8 +188,12 @@ def program(
     output: Path,
     cable_serial: str | None,
     xsdb: Path,
+    *,
+    reservation: ExitStack | None = None,
 ) -> dict:
-    bitstream, scope, bit_evidence, output = map(Path, (bitstream, scope, bit_evidence, output))
+    bitstream, scope, bit_evidence, output = (
+        Path(path).resolve() for path in (bitstream, scope, bit_evidence, output)
+    )
     proof = validate_inputs(bitstream, scope, bit_evidence)
     facts = proof["board"]
     declared_cable = (facts.get("jtag") or {}).get("cable_serial")
@@ -227,7 +232,9 @@ def program(
     with attempt_output(output, summary):
         try:
             script.write_text(tcl_program(bitstream, cable_serial, target_name), encoding="utf-8")
-            with CableLock(cable_serial):
+            with ExitStack() as standalone:
+                owner = standalone if reservation is None else reservation
+                owner.enter_context(CableLock(cable_serial))
                 result = run_xsdb(command, output, timeout=None)
             (output / "stdout.txt").write_text(result.stdout, encoding="utf-8")
             (output / "stderr.txt").write_text(result.stderr, encoding="utf-8")
@@ -243,7 +250,7 @@ def program(
     return summary
 
 
-def main() -> int:
+def main(argv=None, *, reservation: ExitStack | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bitstream", type=Path, required=True)
     parser.add_argument("--io-scope", type=Path, required=True)
@@ -253,7 +260,7 @@ def main() -> int:
         "--cable-serial", default=None, help="defaults to the board profile's jtag.cable_serial"
     )
     parser.add_argument("--xsdb", type=Path, default=Path(r"D:\vitis\2025.2\Vivado\bin\xsdb.bat"))
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     summary = program(
         args.bitstream,
         args.io_scope,
@@ -261,6 +268,7 @@ def main() -> int:
         args.output,
         args.cable_serial,
         args.xsdb,
+        reservation=reservation,
     )
     print(json.dumps(summary, indent=2))
     return 0 if summary["programmed"] else 1
